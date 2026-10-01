@@ -1,18 +1,18 @@
 import sys
 import os
 import re
-import signal
+import socket
 import time
 import threading
 import subprocess
 import ctypes
+import tempfile
 import wave
 from pathlib import Path
 
 import numpy as np
 import mss
 import imageio_ffmpeg
-import soundcard
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -24,9 +24,10 @@ from PyQt6.QtWidgets import (
     QLabel,
     QListWidget,
     QMessageBox,
+    QStackedWidget,
 )
-from PyQt6.QtGui import QIcon, QColor, QPainter, QPen, QFont
-from PyQt6.QtCore import Qt, QRect, QTimer
+from PyQt6.QtGui import QIcon, QColor, QPainter, QPen, QFont, QPixmap, QRegion
+from PyQt6.QtCore import Qt, QRect, QSize, QTimer
 
 # Register AppUserModelID for taskbar icon handling on Windows
 try:
@@ -46,27 +47,145 @@ FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
 
 class ActiveRecordingBorder(QWidget):
-    """Persistent overlay box indicating an active recording area."""
+    """Interactive area frame with its visible outline outside the crop."""
 
-    def __init__(self, region):
+    MARGIN = 12
+    MIN_SIZE = 64
+
+    def __init__(self, region, bounds, on_change):
         super().__init__()
+        self.region = dict(region)
+        self.bounds = bounds
+        self.on_change = on_change
+        self.drag_handle = None
+        self.drag_start = None
+        self.drag_region = None
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
-            | Qt.WindowType.WindowTransparentForInput
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self.update_region(region)
+
+    def update_region(self, region):
+        self.region = dict(region)
+        margin = self.MARGIN
         self.setGeometry(
-            region["left"], region["top"], region["width"], region["height"]
+            self.region["left"] - margin,
+            self.region["top"] - margin,
+            self.region["width"] + margin * 2,
+            self.region["height"] + margin * 2,
         )
-        self.show()
+        selection = QRect(margin, margin, self.region["width"], self.region["height"])
+        self.setMask(QRegion(self.rect()).subtracted(QRegion(selection)))
+        self.update()
+
+    def _hit_test(self, pos):
+        margin = self.MARGIN
+        left = pos.x() < margin
+        right = pos.x() >= margin + self.region["width"]
+        top = pos.y() < margin
+        bottom = pos.y() >= margin + self.region["height"]
+
+        if top and left:
+            return "top_left"
+        if top and right:
+            return "top_right"
+        if bottom and left:
+            return "bottom_left"
+        if bottom and right:
+            return "bottom_right"
+        if top:
+            return "move"
+        if bottom:
+            return "bottom"
+        if left:
+            return "left"
+        if right:
+            return "right"
+        return None
+
+    def mousePressEvent(self, event):
+        self.drag_handle = self._hit_test(event.position().toPoint())
+        self.drag_start = event.globalPosition().toPoint()
+        self.drag_region = dict(self.region)
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.drag_handle is None:
+            handle = self._hit_test(event.position().toPoint())
+            if handle == "move":
+                cursor = Qt.CursorShape.SizeAllCursor
+            elif handle in ("left", "right"):
+                cursor = Qt.CursorShape.SizeHorCursor
+            elif handle in ("top", "bottom"):
+                cursor = Qt.CursorShape.SizeVerCursor
+            elif handle in ("top_left", "bottom_right"):
+                cursor = Qt.CursorShape.SizeFDiagCursor
+            elif handle in ("top_right", "bottom_left"):
+                cursor = Qt.CursorShape.SizeBDiagCursor
+            else:
+                cursor = Qt.CursorShape.ArrowCursor
+            self.setCursor(cursor)
+            return
+
+        current = event.globalPosition().toPoint()
+        delta_x = current.x() - self.drag_start.x()
+        delta_y = current.y() - self.drag_start.y()
+        original = self.drag_region
+        left = original["left"]
+        top = original["top"]
+        right = left + original["width"]
+        bottom = top + original["height"]
+
+        if self.drag_handle == "move":
+            left += delta_x
+            top += delta_y
+            right += delta_x
+            bottom += delta_y
+        else:
+            if "left" in self.drag_handle:
+                left = min(left + delta_x, right - self.MIN_SIZE)
+            if "right" in self.drag_handle:
+                right = max(right + delta_x, left + self.MIN_SIZE)
+            if "top" in self.drag_handle:
+                top = min(top + delta_y, bottom - self.MIN_SIZE)
+            if "bottom" in self.drag_handle:
+                bottom = max(bottom + delta_y, top + self.MIN_SIZE)
+
+        bounds_right = self.bounds["left"] + self.bounds["width"]
+        bounds_bottom = self.bounds["top"] + self.bounds["height"]
+        width = min(right - left, bounds_right - self.bounds["left"])
+        height = min(bottom - top, bounds_bottom - self.bounds["top"])
+        left = max(self.bounds["left"], min(left, bounds_right - width))
+        top = max(self.bounds["top"], min(top, bounds_bottom - height))
+        width -= width % 2
+        height -= height % 2
+        region = {"left": left, "top": top, "width": width, "height": height}
+        self.update_region(region)
+        self.on_change(region)
+
+    def mouseReleaseEvent(self, event):
+        self.drag_handle = None
+        self.drag_start = None
+        self.drag_region = None
+        event.accept()
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        pen = QPen(QColor(255, 0, 0), 4)  # Red border during active recording
-        painter.setPen(pen)
-        painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(255, 54, 68), 3))
+        margin = self.MARGIN
+        painter.drawRect(
+            QRect(
+                margin - 2,
+                margin - 2,
+                self.region["width"] + 3,
+                self.region["height"] + 3,
+            )
+        )
 
 
 class ScreenSelectorOverlay(QWidget):
@@ -131,9 +250,11 @@ class ScreenSelectorOverlay(QWidget):
 class ScreenRecorderApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SCRAP - Screen Capture & Recording Platform")
-        self.setFixedSize(560, 230)
+        self.full_window_title = "SCRAP - Screen Capture & Recording Platform"
+        self.setWindowTitle(self.full_window_title)
+        self.setFixedSize(560, 250)
         self.setFont(QFont("Segoe UI", 10))
+        self.video_encoder = self.detect_video_encoder()
 
         icon_path = Path("assets") / "icon.png"
         if icon_path.exists():
@@ -146,12 +267,21 @@ class ScreenRecorderApp(QMainWindow):
         self.record_start_time = None
         self.ffmpeg_process = None
         self.ffmpeg_returncode = None
-        self.desktop_audio_stop = None
-        self.desktop_audio_thread = None
-        self.desktop_audio_error = None
-        self.desktop_audio_path = None
+        self.audio_capture_stop = None
+        self.audio_capture_thread = None
+        self.audio_capture_error = None
+        self.audio_temp_path = None
+        self.ffmpeg_error_output = ""
         self.current_output_file = None
         self.active_audio_source = "No Audio"
+        self.is_compact_mode = False
+        self.area_crop_port = None
+        self.area_crop_stop = None
+        self.area_crop_thread = None
+        self.area_crop_update_event = None
+        self.area_crop_lock = threading.Lock()
+        self.pending_area_region = None
+        self.area_crop_error = None
         self.record_timer = QTimer(self)
         self.record_timer.setInterval(100)
         self.record_timer.timeout.connect(self.update_record_timer)
@@ -160,10 +290,28 @@ class ScreenRecorderApp(QMainWindow):
         self.apply_styles()
 
     def init_ui(self):
-        central_widget = QWidget(self)
-        self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.setContentsMargins(18, 18, 18, 18)
+        self.view_stack = QStackedWidget(self)
+        self.main_view = QWidget()
+        self.view_stack.addWidget(self.main_view)
+        main_view_layout = QVBoxLayout(self.main_view)
+        main_view_layout.setContentsMargins(12, 6, 12, 10)
+        main_view_layout.setSpacing(2)
+
+        header_layout = QHBoxLayout()
+        header_layout.addStretch()
+        self.btn_compact = QPushButton()
+        self.btn_compact.setObjectName("CompactToggle")
+        self.btn_compact.setFixedSize(28, 24)
+        self.btn_compact.setIcon(self._make_compact_toggle_icon(False))
+        self.btn_compact.setIconSize(QSize(18, 18))
+        self.btn_compact.setToolTip("Switch to compact controls")
+        self.btn_compact.setAccessibleName("Switch to compact controls")
+        self.btn_compact.clicked.connect(self.toggle_compact_mode)
+        header_layout.addWidget(self.btn_compact)
+        main_view_layout.addLayout(header_layout)
+
+        main_layout = QHBoxLayout()
+        main_layout.setContentsMargins(6, 0, 6, 0)
 
         left_layout = QVBoxLayout()
         left_layout.setSpacing(12)
@@ -258,6 +406,89 @@ class ScreenRecorderApp(QMainWindow):
         right_layout.addWidget(self.lbl_status, alignment=Qt.AlignmentFlag.AlignCenter)
         right_layout.addWidget(self.btn_record, alignment=Qt.AlignmentFlag.AlignCenter)
         main_layout.addLayout(right_layout, stretch=1)
+        main_view_layout.addLayout(main_layout, stretch=1)
+
+        self.compact_view = QWidget()
+        compact_layout = QHBoxLayout(self.compact_view)
+        compact_layout.setContentsMargins(10, 4, 10, 4)
+        compact_layout.setSpacing(8)
+
+        self.compact_status = QLabel("Ready")
+        self.compact_status.setObjectName("CompactStatus")
+        self.compact_timer = QLabel(self.lbl_timer.text())
+        self.compact_timer.setObjectName("CompactTimer")
+        self.compact_timer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.compact_timer.setFixedWidth(150)
+        self.btn_compact_record = QPushButton()
+        self.btn_compact_record.setObjectName("CompactRecordButton")
+        self.btn_compact_record.setFixedSize(34, 34)
+        self.btn_compact_record.setIcon(self._make_record_icon(False))
+        self.btn_compact_record.setIconSize(QSize(16, 16))
+        self.btn_compact_record.setToolTip("Start recording")
+        self.btn_compact_record.setAccessibleName("Start recording")
+        self.btn_compact_record.clicked.connect(self.toggle_recording)
+        self.btn_expand = QPushButton()
+        self.btn_expand.setObjectName("CompactToggle")
+        self.btn_expand.setFixedSize(28, 28)
+        self.btn_expand.setIcon(self._make_compact_toggle_icon(True))
+        self.btn_expand.setIconSize(QSize(18, 18))
+        self.btn_expand.setToolTip("Expand settings")
+        self.btn_expand.setAccessibleName("Expand settings")
+        self.btn_expand.clicked.connect(self.toggle_compact_mode)
+
+        compact_layout.addWidget(self.compact_status)
+        compact_layout.addWidget(self.compact_timer, stretch=1)
+        compact_layout.addWidget(self.btn_compact_record)
+        compact_layout.addWidget(self.btn_expand)
+        self.view_stack.addWidget(self.compact_view)
+        self.setCentralWidget(self.view_stack)
+
+    @staticmethod
+    def _make_record_icon(recording):
+        pixmap = QPixmap(18, 18)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#ff4d4d"))
+        if recording:
+            painter.drawRect(4, 4, 10, 10)
+        else:
+            painter.drawEllipse(3, 3, 12, 12)
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _make_compact_toggle_icon(expand):
+        pixmap = QPixmap(20, 20)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#f4ede8"), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(QRect(3, 3, 14, 14), 2, 2)
+        painter.drawLine(3, 7, 17, 7)
+        if expand:
+            painter.drawLine(10, 14, 10, 9)
+            painter.drawLine(7, 12, 10, 9)
+            painter.drawLine(10, 9, 13, 12)
+        else:
+            painter.drawLine(10, 9, 10, 14)
+            painter.drawLine(7, 11, 10, 14)
+            painter.drawLine(10, 14, 13, 11)
+        painter.end()
+        return QIcon(pixmap)
+
+    def toggle_compact_mode(self):
+        self.is_compact_mode = not self.is_compact_mode
+        if self.is_compact_mode:
+            self.view_stack.setCurrentWidget(self.compact_view)
+            self.setWindowTitle("SCRAP")
+            self.setFixedSize(360, 82)
+        else:
+            self.view_stack.setCurrentWidget(self.main_view)
+            self.setWindowTitle(self.full_window_title)
+            self.setFixedSize(560, 250)
 
     def apply_styles(self):
         self.setStyleSheet("""
@@ -305,6 +536,40 @@ class ScreenRecorderApp(QMainWindow):
                 font-weight: 600;
                 min-height: 14px;
             }
+            QLabel#CompactStatus {
+                color: #ff5252;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            QLabel#CompactTimer {
+                color: #ff4d4d;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            QPushButton#CompactToggle {
+                background-color: #3a3432;
+                border: 1px solid #817570;
+                border-radius: 4px;
+                padding: 2px;
+            }
+            QPushButton#CompactToggle:hover {
+                background-color: #514744;
+                border-color: #b4a6a0;
+            }
+            QPushButton#CompactToggle:pressed {
+                background-color: #292423;
+                border-color: #d4af37;
+            }
+            QPushButton#CompactRecordButton {
+                background-color: #282423;
+                border: 2px solid #524743;
+                border-radius: 17px;
+                padding: 0;
+            }
+            QPushButton#CompactRecordButton:hover {
+                background-color: #332726;
+                border-color: #ff5252;
+            }
             QComboBox {
                 border: 1px solid #423c39;
                 border-radius: 6px;
@@ -327,6 +592,13 @@ class ScreenRecorderApp(QMainWindow):
         """)
 
     def set_mode(self, mode):
+        if self.is_recording:
+            return
+
+        if self.active_border is not None:
+            self.active_border.close()
+            self.active_border = None
+
         self.selected_mode = mode
 
         # Uncheck/check mode button visuals
@@ -344,9 +616,152 @@ class ScreenRecorderApp(QMainWindow):
             if hasattr(self, "overlay") and self.overlay:
                 self.overlay.close()
 
+    def _set_recording_controls_enabled(self, enabled):
+        for control in (
+            self.btn_full,
+            self.btn_area,
+            self.combo_quality,
+            self.combo_audio,
+        ):
+            control.setEnabled(enabled)
+
+    def _restore_idle_controls(self):
+        self._set_recording_controls_enabled(True)
+        self.btn_record.setEnabled(True)
+        self.btn_compact_record.setIcon(self._make_record_icon(False))
+        self.btn_compact_record.setToolTip("Start recording")
+        self.btn_compact_record.setAccessibleName("Start recording")
+        self.btn_compact_record.setStyleSheet("")
+        self.btn_compact_record.setEnabled(True)
+        self.compact_status.setText("Ready")
+
+    def _cleanup_desktop_audio_temp(self):
+        if self.audio_temp_path is None:
+            return
+        if self.audio_capture_thread and self.audio_capture_thread.is_alive():
+            return
+
+        try:
+            self.audio_temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self.audio_temp_path = None
+
     def on_area_selected(self, region):
-        self.area_region = region
+        with mss.MSS() as sct:
+            bounds = dict(sct.monitors[1])
+        width = min(region["width"], bounds["width"])
+        height = min(region["height"], bounds["height"])
+        left = max(
+            bounds["left"],
+            min(region["left"], bounds["left"] + bounds["width"] - width),
+        )
+        top = max(
+            bounds["top"],
+            min(region["top"], bounds["top"] + bounds["height"] - height),
+        )
+        self.area_region = {
+            "left": left,
+            "top": top,
+            "width": width - width % 2,
+            "height": height - height % 2,
+        }
+        self.active_border = ActiveRecordingBorder(
+            self.area_region, bounds, self.on_area_region_changed
+        )
+        self.active_border.show()
         self.show()
+
+    def on_area_region_changed(self, region):
+        self.area_region = dict(region)
+        if self.area_crop_update_event is None:
+            return
+        with self.area_crop_lock:
+            self.pending_area_region = dict(region)
+        self.area_crop_update_event.set()
+
+    def _start_area_crop_control(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as port_socket:
+            port_socket.bind(("127.0.0.1", 0))
+            self.area_crop_port = port_socket.getsockname()[1]
+
+        self.area_crop_stop = threading.Event()
+        self.area_crop_update_event = threading.Event()
+        self.pending_area_region = dict(self.area_region)
+        self.area_crop_error = None
+        self.area_crop_thread = threading.Thread(
+            target=self._area_crop_command_worker,
+            args=(self.area_crop_port, self.area_crop_stop),
+            daemon=True,
+        )
+        self.area_crop_thread.start()
+        return self.area_crop_port
+
+    def _area_crop_command_worker(self, port, stop_event):
+        import zmq
+
+        context = zmq.Context()
+        client = None
+
+        def connect_client():
+            new_client = context.socket(zmq.REQ)
+            new_client.setsockopt(zmq.LINGER, 0)
+            new_client.setsockopt(zmq.SNDTIMEO, 200)
+            new_client.connect(f"tcp://127.0.0.1:{port}")
+            return new_client
+
+        client = connect_client()
+        last_region = None
+        try:
+            while not stop_event.is_set():
+                if not self.area_crop_update_event.wait(0.1):
+                    continue
+                self.area_crop_update_event.clear()
+                with self.area_crop_lock:
+                    region = dict(self.pending_area_region)
+                if region == last_region:
+                    continue
+
+                monitor_left = self.area_region_bounds["left"]
+                monitor_top = self.area_region_bounds["top"]
+                values = {
+                    "w": region["width"],
+                    "h": region["height"],
+                    "x": region["left"] - monitor_left,
+                    "y": region["top"] - monitor_top,
+                }
+                try:
+                    for option, value in values.items():
+                        client.send_string(f"crop@area {option} {value}")
+                        if not client.poll(250):
+                            raise zmq.Again()
+                        response = client.recv_string()
+                        if not response.startswith("0 "):
+                            raise RuntimeError(response)
+                    last_region = region
+                except (zmq.ZMQError, RuntimeError) as exc:
+                    self.area_crop_error = str(exc)
+                    client.close(0)
+                    client = connect_client()
+                    with self.area_crop_lock:
+                        self.pending_area_region = region
+                    self.area_crop_update_event.set()
+                    stop_event.wait(0.1)
+        finally:
+            client.close(0)
+            context.term()
+
+    def _stop_area_crop_control(self):
+        if self.area_crop_stop is not None:
+            self.area_crop_stop.set()
+        if self.area_crop_update_event is not None:
+            self.area_crop_update_event.set()
+        if self.area_crop_thread is not None:
+            self.area_crop_thread.join(timeout=2)
+        self.area_crop_port = None
+        self.area_crop_stop = None
+        self.area_crop_thread = None
+        self.area_crop_update_event = None
 
     def toggle_recording(self):
         if not self.is_recording:
@@ -367,6 +782,7 @@ class ScreenRecorderApp(QMainWindow):
 
         text = f"{days:02d}:{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
         self.lbl_timer.setText(text)
+        self.compact_timer.setText(text)
 
     def resolve_target_size(self, selected_q):
         if "Native / Original" in selected_q:
@@ -378,6 +794,46 @@ class ScreenRecorderApp(QMainWindow):
         if "1440p" in selected_q:
             return (2560, 1440)
         return None
+
+    def detect_video_encoder(self):
+        hardware_encoders = (
+            ("h264_qsv", ["-preset", "4", "-global_quality", "20"]),
+            ("h264_mf", ["-rate_control", "3", "-quality", "80"]),
+        )
+        for encoder, encoder_options in hardware_encoders:
+            probe_cmd = [
+                FFMPEG_EXE,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=320x240:r=1",
+                "-frames:v",
+                "1",
+                "-c:v",
+                encoder,
+                *encoder_options,
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "null",
+                "-",
+            ]
+            try:
+                result = subprocess.run(
+                    probe_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=8,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode == 0:
+                return encoder
+        return "libx264"
 
     def discover_audio_devices(self):
         try:
@@ -433,29 +889,48 @@ class ScreenRecorderApp(QMainWindow):
         self.active_audio_source = selected_audio
         self.ffmpeg_returncode = None
 
-        if selected_audio == "Desktop Audio":
-            self.desktop_audio_path = output_filename.with_suffix(".desktop.wav")
-            self.desktop_audio_stop = threading.Event()
+        if selected_audio != "No Audio":
+            with tempfile.NamedTemporaryFile(
+                prefix="scrap_audio_", suffix=".wav", delete=False
+            ) as audio_temp:
+                self.audio_temp_path = Path(audio_temp.name)
+            self.audio_capture_stop = threading.Event()
             audio_ready = threading.Event()
-            self.desktop_audio_error = None
-            self.desktop_audio_thread = threading.Thread(
-                target=self.capture_desktop_audio,
-                args=(self.desktop_audio_path, self.desktop_audio_stop, audio_ready),
+            self.audio_capture_error = None
+            self.audio_capture_thread = threading.Thread(
+                target=self.capture_audio_source,
+                args=(
+                    self.audio_temp_path,
+                    self.audio_capture_stop,
+                    audio_ready,
+                    selected_audio,
+                ),
             )
-            self.desktop_audio_thread.start()
-            if not audio_ready.wait(timeout=10) or self.desktop_audio_error:
-                self.desktop_audio_stop.set()
-                self.desktop_audio_thread.join(timeout=5)
+            self.audio_capture_thread.start()
+            if not audio_ready.wait(timeout=10) or self.audio_capture_error:
+                self.audio_capture_stop.set()
+                self.audio_capture_thread.join(timeout=5)
                 error = (
-                    self.desktop_audio_error or "Timed out opening the playback device."
+                    self.audio_capture_error
+                    or "Timed out opening the selected audio device."
                 )
-                QMessageBox.warning(self, "Desktop Audio Unavailable", error)
+                self._cleanup_desktop_audio_temp()
+                QMessageBox.warning(self, "Audio Device Unavailable", error)
                 return
 
+        crop_control_port = None
+        if self.selected_mode == "Area":
+            with mss.MSS() as sct:
+                self.area_region_bounds = dict(sct.monitors[1])
+            crop_control_port = self._start_area_crop_control()
+
         self.is_recording = True
+        self._set_recording_controls_enabled(False)
         self.record_start_time = time.monotonic()
         self.lbl_timer.setText("00:00:00:00.000")
+        self.compact_timer.setText("00:00:00:00.000")
         self.lbl_status.setText("Recording...")
+        self.compact_status.setText("REC")
         self.record_timer.start()
 
         self.btn_record.setText("■\nStop")
@@ -464,38 +939,51 @@ class ScreenRecorderApp(QMainWindow):
             "border: 3px solid #ff5252; color: #ffffff;"
             "font-size: 13px; font-weight: bold;"
         )
-
-        # Show persistent boundary for selected Area recording
-        if self.selected_mode == "Area" and self.area_region:
-            self.active_border = ActiveRecordingBorder(self.area_region)
+        self.btn_compact_record.setIcon(self._make_record_icon(True))
+        self.btn_compact_record.setToolTip("Stop recording")
+        self.btn_compact_record.setAccessibleName("Stop recording")
+        self.btn_compact_record.setStyleSheet("background-color: #d32f2f;")
 
         fps = 60.0 if "60 FPS" in selected_q else 30.0
         target_size = self.resolve_target_size(selected_q)
         self.rec_thread = threading.Thread(
             target=self.record_engine,
-            args=(output_filename, fps, target_size, selected_audio),
+            args=(output_filename, fps, target_size, crop_control_port),
         )
         self.rec_thread.start()
 
-    def capture_desktop_audio(self, output_file, stop_event, ready_event):
+    def capture_audio_source(self, output_file, stop_event, ready_event, audio_source):
         try:
-            loopback_devices = [
+            import soundcard
+
+            is_desktop_audio = audio_source == "Desktop Audio"
+            input_devices = [
                 microphone
                 for microphone in soundcard.all_microphones(include_loopback=True)
-                if microphone.isloopback
+                if microphone.isloopback == is_desktop_audio
             ]
-            if not loopback_devices:
-                raise RuntimeError("No desktop playback loopback device is available.")
+            if not input_devices:
+                raise RuntimeError("No matching audio input device is available.")
 
-            default_speaker = soundcard.default_speaker()
-            microphone = next(
-                (
-                    device
-                    for device in loopback_devices
-                    if device.name == default_speaker.name
-                ),
-                loopback_devices[0],
-            )
+            if is_desktop_audio:
+                default_speaker = soundcard.default_speaker()
+                microphone = next(
+                    (
+                        device
+                        for device in input_devices
+                        if device.name == default_speaker.name
+                    ),
+                    input_devices[0],
+                )
+            else:
+                microphone = next(
+                    (device for device in input_devices if device.name == audio_source),
+                    None,
+                )
+                if microphone is None:
+                    raise RuntimeError(
+                        f"The selected audio input was not found: {audio_source}"
+                    )
             channels = min(microphone.channels, 2)
 
             with wave.open(str(output_file), "wb") as audio_file:
@@ -504,7 +992,9 @@ class ScreenRecorderApp(QMainWindow):
                 audio_file.setframerate(48000)
 
                 with microphone.recorder(
-                    samplerate=48000, channels=list(range(channels))
+                    samplerate=48000,
+                    channels=list(range(channels)),
+                    blocksize=24000,
                 ) as recorder:
                     while not stop_event.is_set():
                         samples = recorder.record(numframes=4800)
@@ -512,32 +1002,39 @@ class ScreenRecorderApp(QMainWindow):
                         audio_file.writeframesraw(pcm.tobytes())
                         ready_event.set()
         except Exception as exc:
-            self.desktop_audio_error = str(exc)
+            self.audio_capture_error = str(exc)
         finally:
             ready_event.set()
 
     def stop_recording(self):
-        self.is_recording = False
-        if self.desktop_audio_stop is not None:
-            self.desktop_audio_stop.set()
-        self.record_timer.stop()
-        self.record_start_time = None
-        self.lbl_timer.setText("00:00:00:00.000")
-        self.lbl_status.setText("Finalizing video...")
-
         if self.active_border is not None:
             self.active_border.close()
             self.active_border = None
 
+        self.is_recording = False
+        self._stop_area_crop_control()
+        if self.audio_capture_stop is not None:
+            self.audio_capture_stop.set()
+        self.record_timer.stop()
+        self.record_start_time = None
+        self.lbl_timer.setText("00:00:00:00.000")
+        self.compact_timer.setText("00:00:00:00.000")
+        self.lbl_status.setText("Finalizing video...")
+        self.compact_status.setText("Saving")
+
         self.btn_record.setText("🔴\nRecord")
         self.btn_record.setStyleSheet("")
+        self.btn_record.setEnabled(False)
+        self.btn_compact_record.setIcon(self._make_record_icon(False))
+        self.btn_compact_record.setToolTip("Finalizing recording")
+        self.btn_compact_record.setEnabled(False)
         self.apply_styles()
 
         if hasattr(self, "rec_thread") and self.rec_thread.is_alive():
             self.rec_thread.join(timeout=60)
 
-        if self.desktop_audio_thread is not None:
-            self.desktop_audio_thread.join(timeout=10)
+        if self.audio_capture_thread is not None:
+            self.audio_capture_thread.join(timeout=10)
 
         if hasattr(self, "rec_thread") and self.rec_thread.is_alive():
             self.lbl_status.setText("Recording stop timed out")
@@ -550,20 +1047,38 @@ class ScreenRecorderApp(QMainWindow):
 
         if self.ffmpeg_returncode not in (None, 0):
             self.lbl_status.setText("Recording failed")
+            self._cleanup_desktop_audio_temp()
+            self._restore_idle_controls()
+            details = self.ffmpeg_error_output.strip()
+            message = f"FFmpeg exited with code {self.ffmpeg_returncode}."
+            if details:
+                message += f"\n\n{details[-1400:]}"
             QMessageBox.warning(
                 self,
                 "Recording Failed",
-                f"FFmpeg exited with code {self.ffmpeg_returncode}.",
+                message,
             )
             return
 
-        if self.active_audio_source == "Desktop Audio":
-            if self.desktop_audio_thread.is_alive() or self.desktop_audio_error:
-                self.lbl_status.setText("Desktop audio capture failed")
+        if self.active_audio_source != "No Audio":
+            if self.audio_capture_thread.is_alive():
+                self.lbl_status.setText("Audio capture stop timed out")
                 QMessageBox.warning(
                     self,
-                    "Desktop Audio Failed",
-                    self.desktop_audio_error or "Desktop audio capture did not stop.",
+                    "Audio Capture Incomplete",
+                    "Audio capture did not stop in time. Restart the app before "
+                    "recording again.",
+                )
+                return
+
+            if self.audio_capture_error:
+                self.lbl_status.setText("Audio capture failed")
+                self._cleanup_desktop_audio_temp()
+                self._restore_idle_controls()
+                QMessageBox.warning(
+                    self,
+                    "Audio Capture Failed",
+                    self.audio_capture_error,
                 )
                 return
 
@@ -577,7 +1092,7 @@ class ScreenRecorderApp(QMainWindow):
                     "-i",
                     str(self.current_output_file),
                     "-i",
-                    str(self.desktop_audio_path),
+                    str(self.audio_temp_path),
                     "-map",
                     "0:v:0",
                     "-map",
@@ -602,31 +1117,34 @@ class ScreenRecorderApp(QMainWindow):
                 details = (
                     mux_result.stderr[-1200:] or "FFmpeg could not mux desktop audio."
                 )
+                muxed_file.unlink(missing_ok=True)
+                self._cleanup_desktop_audio_temp()
+                self._restore_idle_controls()
                 QMessageBox.warning(self, "Audio Mux Failed", details)
                 return
 
             os.replace(muxed_file, self.current_output_file)
-            self.desktop_audio_path.unlink(missing_ok=True)
+            self._cleanup_desktop_audio_temp()
 
         if (
             not self.current_output_file.exists()
             or self.current_output_file.stat().st_size == 0
         ):
             self.lbl_status.setText("Recording failed")
+            self._cleanup_desktop_audio_temp()
+            self._restore_idle_controls()
             QMessageBox.warning(
                 self, "Recording Failed", "FFmpeg did not create a playable recording."
             )
             return
 
         self.lbl_status.setText("Saved")
+        self._restore_idle_controls()
         QMessageBox.information(self, "Saved", f"Recording saved to:\n{VIDEO_DIR}")
 
-    def record_engine(self, output_file, fps, target_size=None, audio_device=None):
-        if self.selected_mode == "Area" and self.area_region:
-            monitor = self.area_region
-        else:
-            with mss.MSS() as sct:
-                monitor = sct.monitors[1]
+    def record_engine(self, output_file, fps, target_size=None, crop_control_port=None):
+        with mss.MSS() as sct:
+            monitor = dict(sct.monitors[1])
 
         width = monitor["width"]
         height = monitor["height"]
@@ -653,7 +1171,44 @@ class ScreenRecorderApp(QMainWindow):
             "desktop",
         ]
 
-        if target_size is not None:
+        if self.selected_mode == "Area" and self.area_region:
+            region = dict(self.area_region)
+            crop_width = region["width"] - region["width"] % 2
+            crop_height = region["height"] - region["height"] % 2
+            output_width, output_height = target_size or (crop_width, crop_height)
+            crop_x = region["left"] - left
+            crop_y = region["top"] - top
+            escaped = "\\" * 2
+            zmq_address = f"tcp{escaped}://127.0.0.1{escaped}:{crop_control_port}"
+            video_filter = (
+                f"zmq=bind_address={zmq_address},"
+                f"crop@area={crop_width}:{crop_height}:{crop_x}:{crop_y},"
+                f"scale={output_width}:{output_height}:"
+                "force_original_aspect_ratio=decrease,"
+                f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+            )
+            ffmpeg_cmd += [
+                "-vf",
+                video_filter,
+            ]
+        if self.selected_mode == "Area" and self.area_region:
+            region = dict(self.area_region)
+            crop_width = region["width"] - region["width"] % 2
+            crop_height = region["height"] - region["height"] % 2
+            output_width, output_height = target_size or (crop_width, crop_height)
+            crop_x = region["left"] - left
+            crop_y = region["top"] - top
+            escaped = "\\" * 2
+            zmq_address = f"tcp{escaped}://127.0.0.1{escaped}:{crop_control_port}"
+            video_filter = (
+                f"zmq=bind_address={zmq_address},"
+                f"crop@area={crop_width}:{crop_height}:{crop_x}:{crop_y},"
+                f"scale={output_width}:{output_height}:"
+                "force_original_aspect_ratio=decrease,"
+                f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+            )
+            ffmpeg_cmd += ["-vf", video_filter]
+        elif target_size is not None:
             output_width, output_height = target_size
             ffmpeg_cmd += [
                 "-vf",
@@ -661,37 +1216,25 @@ class ScreenRecorderApp(QMainWindow):
                 f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,setsar=1",
             ]
 
-        if audio_device and audio_device not in ("No Audio", "Desktop Audio"):
-            ffmpeg_cmd += ["-f", "dshow", "-i", f"audio={audio_device}"]
-
-        ffmpeg_cmd += [
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
-        ]
-
-        if audio_device and audio_device not in ("No Audio", "Desktop Audio"):
-            ffmpeg_cmd += ["-c:a", "aac", "-movflags", "+faststart"]
+        ffmpeg_cmd += ["-c:v", self.video_encoder]
+        if self.video_encoder == "h264_qsv":
+            ffmpeg_cmd += ["-preset", "4", "-global_quality", "20"]
+        elif self.video_encoder == "h264_mf":
+            ffmpeg_cmd += ["-rate_control", "3", "-quality", "80"]
         else:
-            ffmpeg_cmd += ["-an", "-movflags", "+faststart"]
+            ffmpeg_cmd += ["-preset", "veryfast", "-crf", "20"]
+        ffmpeg_cmd += ["-pix_fmt", "yuv420p"]
+
+        ffmpeg_cmd += ["-an", "-movflags", "+faststart"]
 
         ffmpeg_cmd.append(str(output_file))
 
-        creation_flags = 0
-        if os.name == "nt":
-            creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
-
+        stderr_log = tempfile.TemporaryFile()
         self.ffmpeg_process = subprocess.Popen(
             ffmpeg_cmd,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creation_flags,
+            stderr=stderr_log,
         )
 
         while self.is_recording:
@@ -700,10 +1243,9 @@ class ScreenRecorderApp(QMainWindow):
         process = self.ffmpeg_process
         if process and process.poll() is None:
             try:
-                if os.name == "nt":
-                    process.send_signal(signal.CTRL_BREAK_EVENT)
-                else:
-                    process.send_signal(signal.SIGINT)
+                if process.stdin:
+                    process.stdin.write(b"q\n")
+                    process.stdin.flush()
                 process.wait(timeout=25)
             except Exception:
                 try:
@@ -713,8 +1255,16 @@ class ScreenRecorderApp(QMainWindow):
                     process.kill()
                     process.wait(timeout=10)
 
+                if process and process.stdin and not process.stdin.closed:
+                    process.stdin.close()
+
         if process:
-            self.ffmpeg_returncode = process.returncode
+            self.ffmpeg_returncode = ctypes.c_int32(process.returncode).value
+        stderr_log.seek(0)
+        self.ffmpeg_error_output = stderr_log.read().decode("utf-8", errors="replace")[
+            -4000:
+        ]
+        stderr_log.close()
         self.ffmpeg_process = None
 
     def open_gallery(self):

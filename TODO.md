@@ -9,6 +9,9 @@
 | **Frame Rates** | 30 FPS max | 60 FPS |
 | **Encoding Acceleration** | Software (`XVID` / `libx264`) | Hardware Accelerated (`h264_nvenc` / `h264_amf`) |
 | **Watermark / Ads** | Small watermark on output | Clean output, no watermarks |
+| **Recording Duration** | Up to 3 minutes per recording | Unlimited recording |
+| **Purchase Model** | — | One-time payment |
+| **Simultaneous Areas** | Single capture area | Multiple capture areas at once |
 
 ## 1b.Add minimize button for record UI
 
@@ -30,6 +33,9 @@
   - [ ] Gate Area and Window capture options for non-Pro users
   - [ ] Gate 1080p 60 FPS and 1440p presets behind Pro check
   - [ ] Show unlock popup when clicking restricted features in Free tier
+    - [ ] Limit Free recordings to 3 minutes and show an upgrade prompt at the limit
+    - [ ] Unlock unlimited recording time with a one-time Premium purchase
+    - [ ] Allow Premium users to record multiple selected areas simultaneously
 
 ---
 

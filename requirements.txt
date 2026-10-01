@@ -3,3 +3,4 @@ mss
 imageio-ffmpeg
 numpy
 soundcard>=0.4.6
+pyzmq>=26
