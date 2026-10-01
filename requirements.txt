@@ -1,0 +1,6 @@
+PyQt6
+mss
+pywinctl
+imageio-ffmpeg
+numpy
+soundcard>=0.4.6

@@ -10,6 +10,8 @@
 | **Encoding Acceleration** | Software (`XVID` / `libx264`) | Hardware Accelerated (`h264_nvenc` / `h264_amf`) |
 | **Watermark / Ads** | Small watermark on output | Clean output, no watermarks |
 
+## 1b.Add minimize button for record UI
+
 ---
 
 ## 2. Implementation Tasks
