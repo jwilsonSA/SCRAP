@@ -1,0 +1,10 @@
+[tool.ruff]
+# Set maximum line length to modern standard (88 or 120)
+line-length = 88
+
+[tool.ruff.lint]
+# Select standard linting rules (Pyflakes, pycodestyle, etc.)
+select = ["E", "F", "W"]
+
+# Optional: Ignore specific rules if needed
+ignore = []
