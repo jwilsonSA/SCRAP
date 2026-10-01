@@ -11,7 +11,6 @@ from pathlib import Path
 
 import numpy as np
 import mss
-import pywinctl
 import imageio_ffmpeg
 import soundcard
 from PyQt6.QtWidgets import (
@@ -26,7 +25,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QMessageBox,
 )
-from PyQt6.QtGui import QIcon, QColor, QPainter, QPen, QCursor, QFont
+from PyQt6.QtGui import QIcon, QColor, QPainter, QPen, QFont
 from PyQt6.QtCore import Qt, QRect, QTimer
 
 # Register AppUserModelID for taskbar icon handling on Windows
@@ -51,7 +50,6 @@ class ActiveRecordingBorder(QWidget):
 
     def __init__(self, region):
         super().__init__()
-        self.region = region
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -72,13 +70,11 @@ class ActiveRecordingBorder(QWidget):
 
 
 class ScreenSelectorOverlay(QWidget):
-    """Overlay for custom area crop and window boundary targeting."""
+    """Overlay for custom area selection."""
 
-    def __init__(self, mode="Area", callback=None):
+    def __init__(self, callback=None):
         super().__init__()
-        self.mode = mode
         self.callback = callback
-        self.is_locked = False  # Track if a window selection has been locked
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -91,77 +87,20 @@ class ScreenSelectorOverlay(QWidget):
         self.start_point = None
         self.end_point = None
         self.is_drawing = False
-        self.detected_windows = []
-        self.highlighted_rect = None
-
-        if self.mode == "Window":
-            self.setMouseTracking(True)
-            self.fetch_window_rects()
-
-    def fetch_window_rects(self):
-        """Fetches active application window dimensions cleanly."""
-        self.detected_windows = []
-        current_hwnd = int(self.winId()) if hasattr(self, "winId") else 0
-
-        for win in pywinctl.getAllWindows():
-            try:
-                # Exclude current overlay window
-                if hasattr(win, "getHandle") and win.getHandle() == current_hwnd:
-                    continue
-
-                title = win.title.strip() if win.title else ""
-                if not title or not win.isVisible:
-                    continue
-
-                w, h = win.width, win.height
-                if w > 100 and h > 100:
-                    self.detected_windows.append(QRect(win.left, win.top, w, h))
-            except Exception:
-                # Ignore windows that close, lack permissions, or throw handle errors
-                continue
 
     def mouseMoveEvent(self, event):
-        pos = event.pos()
-        global_pos = QCursor.pos()
-
-        # Stop moving/tracking once locked
-        if self.is_locked:
-            return
-
-        if self.mode == "Area" and self.is_drawing:
-            self.end_point = pos
+        if self.is_drawing:
+            self.end_point = event.pos()
             self.update()
-        elif self.mode == "Window":
-            found = None
-            for rect in self.detected_windows:
-                if rect.contains(global_pos):
-                    found = rect
-                    break
-            if found != self.highlighted_rect:
-                self.highlighted_rect = found
-                self.update()
 
     def mousePressEvent(self, event):
-        if self.mode == "Area":
-            self.start_point = event.pos()
-            self.end_point = event.pos()
-            self.is_drawing = True
-            self.update()
-        elif self.mode == "Window" and self.highlighted_rect:
-            self.is_locked = True
-            rect = self.highlighted_rect
-            region = {
-                "top": rect.top(),
-                "left": rect.left(),
-                "width": rect.width(),
-                "height": rect.height(),
-            }
-            if self.callback:
-                self.callback(region)
-            self.close()
+        self.start_point = event.pos()
+        self.end_point = event.pos()
+        self.is_drawing = True
+        self.update()
 
     def mouseReleaseEvent(self, event):
-        if self.mode == "Area" and self.is_drawing:
+        if self.is_drawing:
             self.is_drawing = False
             rect = QRect(self.start_point, self.end_point).normalized()
             region = {
@@ -178,7 +117,7 @@ class ScreenSelectorOverlay(QWidget):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(0, 0, 0, 100))
 
-        if self.mode == "Area" and self.start_point and self.end_point:
+        if self.start_point and self.end_point:
             rect = QRect(self.start_point, self.end_point).normalized()
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
             painter.fillRect(rect, QColor(0, 0, 0, 0))
@@ -186,16 +125,6 @@ class ScreenSelectorOverlay(QWidget):
                 QPainter.CompositionMode.CompositionMode_SourceOver
             )
             painter.setPen(QPen(QColor(212, 175, 55), 2))
-            painter.drawRect(rect)
-
-        elif self.mode == "Window" and self.highlighted_rect:
-            rect = self.highlighted_rect
-            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-            painter.fillRect(rect, QColor(0, 0, 0, 0))
-            painter.setCompositionMode(
-                QPainter.CompositionMode.CompositionMode_SourceOver
-            )
-            painter.setPen(QPen(QColor(212, 175, 55), 3))
             painter.drawRect(rect)
 
 
@@ -409,9 +338,7 @@ class ScreenRecorderApp(QMainWindow):
 
         # Launch overlay immediately when Area is selected
         if mode == "Area":
-            self.overlay = ScreenSelectorOverlay(
-                mode=mode, callback=self.on_area_selected
-            )
+            self.overlay = ScreenSelectorOverlay(callback=self.on_area_selected)
             self.overlay.show()
         else:
             if hasattr(self, "overlay") and self.overlay:
@@ -493,7 +420,7 @@ class ScreenRecorderApp(QMainWindow):
             return
 
         if self.selected_mode == "Area":
-            if not hasattr(self, "area_region") or not self.area_region:
+            if not self.area_region:
                 QMessageBox.warning(
                     self, "No Area Selected", "Please select a screen area first."
                 )
@@ -695,20 +622,16 @@ class ScreenRecorderApp(QMainWindow):
         QMessageBox.information(self, "Saved", f"Recording saved to:\n{VIDEO_DIR}")
 
     def record_engine(self, output_file, fps, target_size=None, audio_device=None):
-        monitor = None
         if self.selected_mode == "Area" and self.area_region:
             monitor = self.area_region
         else:
             with mss.MSS() as sct:
                 monitor = sct.monitors[1]
 
-        width = monitor["width"] if isinstance(monitor, dict) else 1920
-        height = monitor["height"] if isinstance(monitor, dict) else 1080
-        left = monitor.get("left", 0) if isinstance(monitor, dict) else 0
-        top = monitor.get("top", 0) if isinstance(monitor, dict) else 0
-
-        if target_size is not None:
-            width, height = target_size
+        width = monitor["width"]
+        height = monitor["height"]
+        left = monitor["left"]
+        top = monitor["top"]
 
         width = width if width % 2 == 0 else width - 1
         height = height if height % 2 == 0 else height - 1
@@ -729,6 +652,14 @@ class ScreenRecorderApp(QMainWindow):
             "-i",
             "desktop",
         ]
+
+        if target_size is not None:
+            output_width, output_height = target_size
+            ffmpeg_cmd += [
+                "-vf",
+                f"scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,"
+                f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,setsar=1",
+            ]
 
         if audio_device and audio_device not in ("No Audio", "Desktop Audio"):
             ffmpeg_cmd += ["-f", "dshow", "-i", f"audio={audio_device}"]
@@ -757,7 +688,7 @@ class ScreenRecorderApp(QMainWindow):
 
         self.ffmpeg_process = subprocess.Popen(
             ffmpeg_cmd,
-            stdin=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=creation_flags,
@@ -766,23 +697,24 @@ class ScreenRecorderApp(QMainWindow):
         while self.is_recording:
             time.sleep(0.05)
 
-        if self.ffmpeg_process and self.ffmpeg_process.poll() is None:
+        process = self.ffmpeg_process
+        if process and process.poll() is None:
             try:
                 if os.name == "nt":
-                    self.ffmpeg_process.send_signal(signal.CTRL_BREAK_EVENT)
+                    process.send_signal(signal.CTRL_BREAK_EVENT)
                 else:
-                    self.ffmpeg_process.send_signal(signal.SIGINT)
-                self.ffmpeg_process.wait(timeout=25)
+                    process.send_signal(signal.SIGINT)
+                process.wait(timeout=25)
             except Exception:
                 try:
-                    self.ffmpeg_process.terminate()
-                    self.ffmpeg_process.wait(timeout=10)
+                    process.terminate()
+                    process.wait(timeout=10)
                 except Exception:
-                    self.ffmpeg_process.kill()
-                    self.ffmpeg_process.wait(timeout=10)
+                    process.kill()
+                    process.wait(timeout=10)
 
-                if self.ffmpeg_process:
-                    self.ffmpeg_returncode = self.ffmpeg_process.returncode
+        if process:
+            self.ffmpeg_returncode = process.returncode
         self.ffmpeg_process = None
 
     def open_gallery(self):
