@@ -3,12 +3,27 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
 
-$Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+$VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+$Python = $VenvPython
 if (-not (Test-Path $Python)) {
-    throw "Virtual environment not found. Create it with: python -m venv .venv"
+    $PythonLauncher = Get-Command py -ErrorAction SilentlyContinue
+    if ($PythonLauncher) {
+        & py -3 -m venv .venv
+    } else {
+        $SystemPython = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $SystemPython) {
+            throw "Python is required to build this app. Install Python 3.11-3.13 from python.org and enable Add Python to PATH, or install the Python Launcher."
+        }
+        & python -m venv .venv
+    }
+    if (-not (Test-Path $VenvPython)) {
+        throw "Failed to create the project virtual environment."
+    }
 }
 
-& $Python -m pip install --upgrade pyinstaller pillow
+& $VenvPython -m pip install --upgrade pip
+& $VenvPython -m pip install -r requirements.txt
+& $VenvPython -m pip install --upgrade pyinstaller pillow
 
 $IconPng = Join-Path $ProjectRoot "assets\icon.png"
 $IconIco = Join-Path $ProjectRoot "assets\icon.ico"
@@ -20,12 +35,7 @@ image.save(r'''$IconIco''', format='ICO', sizes=[(256, 256), (128, 128), (64, 64
 "@
 & $Python -c $IconScript
 
-& $Python -m PyInstaller --noconfirm --clean --noconsole --onedir `
-    --name SCRAP `
-    --icon $IconIco `
-    --splash $IconPng `
-    --add-data "assets;assets" `
-    app_gui.py
+& $VenvPython -m PyInstaller --noconfirm --clean SCRAP.spec
 
 $ExePath = Join-Path $ProjectRoot "dist\SCRAP\SCRAP.exe"
 if (-not (Test-Path $ExePath)) {
@@ -48,7 +58,14 @@ Windows may show SmartScreen or antivirus warnings for an unsigned app.
 
 $ZipPath = Join-Path $ProjectRoot "dist\SCRAP-Portable.zip"
 if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
-Compress-Archive -Path (Join-Path $ProjectRoot "dist\SCRAP") -DestinationPath $ZipPath -CompressionLevel Optimal
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$PortableFolder = Join-Path $ProjectRoot "dist\SCRAP"
+[IO.Compression.ZipFile]::CreateFromDirectory(
+    $PortableFolder,
+    $ZipPath,
+    [IO.Compression.CompressionLevel]::Optimal,
+    $false
+)
 
 $DesktopPath = [Environment]::GetFolderPath("Desktop")
 $ShortcutPath = Join-Path $DesktopPath "SCRAP.lnk"

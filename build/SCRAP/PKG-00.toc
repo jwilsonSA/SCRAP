@@ -35,6 +35,10 @@
    'E:\\Private\\Coding\\Screen '
    'Recorder\\.venv\\Lib\\site-packages\\PyInstaller\\loader\\pyiboot01_bootstrap.py',
    'PYSOURCE'),
+  ('pyi_rth__tkinter',
+   'E:\\Private\\Coding\\Screen '
+   'Recorder\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth__tkinter.py',
+   'PYSOURCE'),
   ('pyi_rth_inspect',
    'E:\\Private\\Coding\\Screen '
    'Recorder\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_inspect.py',
@@ -55,10 +59,7 @@
    'E:\\Private\\Coding\\Screen '
    'Recorder\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_pyqt6.py',
    'PYSOURCE'),
-  ('app_gui', 'E:\\Private\\Coding\\Screen Recorder\\app_gui.py', 'PYSOURCE'),
-  ('Splash-00.res',
-   'E:\\Private\\Coding\\Screen Recorder\\build\\SCRAP\\Splash-00.res',
-   'SPLASH')],
+  ('app_gui', 'E:\\Private\\Coding\\Screen Recorder\\app_gui.py', 'PYSOURCE')],
  'python313.dll',
  True,
  False,
