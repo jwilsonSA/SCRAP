@@ -81,6 +81,19 @@ CURRENT_TIER = "Pro"
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
 
+def hidden_subprocess_kwargs():
+    """Prevent Windows console windows from appearing for FFmpeg helpers."""
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+        "startupinfo": startupinfo,
+    }
+
+
 def resource_path(relative_path):
     """Resolve bundled resources both from source and from the PyInstaller app."""
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -327,6 +340,11 @@ class ScreenRecorderApp(QMainWindow):
         self.record_timer = QTimer(self)
         self.record_timer.setInterval(100)
         self.record_timer.timeout.connect(self.update_record_timer)
+        self.countdown_timer = QTimer(self)
+        self.countdown_timer.setInterval(1000)
+        self.countdown_timer.timeout.connect(self._update_countdown)
+        self.countdown_remaining = 0
+        self.is_counting_down = False
 
         self.init_ui()
         self.apply_styles()
@@ -484,6 +502,16 @@ class ScreenRecorderApp(QMainWindow):
         compact_layout.addWidget(self.btn_expand)
         self.view_stack.addWidget(self.compact_view)
         self.setCentralWidget(self.view_stack)
+
+        self.countdown_label = QLabel(self.view_stack)
+        self.countdown_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.countdown_label.setFixedSize(140, 140)
+        self.countdown_label.setStyleSheet(
+            "background-color: rgba(28, 26, 25, 220);"
+            "border: 3px solid #ff5252; border-radius: 70px;"
+            "color: white; font-size: 72px; font-weight: bold;"
+        )
+        self.countdown_label.hide()
 
     @staticmethod
     def _make_record_icon(recording):
@@ -806,6 +834,8 @@ class ScreenRecorderApp(QMainWindow):
         self.area_crop_update_event = None
 
     def toggle_recording(self):
+        if self.is_counting_down:
+            return
         if not self.is_recording:
             self.start_recording()
         else:
@@ -870,6 +900,7 @@ class ScreenRecorderApp(QMainWindow):
                     stderr=subprocess.DEVNULL,
                     check=False,
                     timeout=8,
+                    **hidden_subprocess_kwargs(),
                 )
             except (OSError, subprocess.TimeoutExpired):
                 continue
@@ -895,6 +926,7 @@ class ScreenRecorderApp(QMainWindow):
                 stderr=subprocess.STDOUT,
                 text=True,
                 check=False,
+                **hidden_subprocess_kwargs(),
             )
             devices = []
             seen = set()
@@ -924,6 +956,39 @@ class ScreenRecorderApp(QMainWindow):
                 )
                 return
 
+        self.is_counting_down = True
+        self.countdown_remaining = 3
+        self._set_recording_controls_enabled(False)
+        self.btn_record.setEnabled(False)
+        self.btn_compact_record.setEnabled(False)
+        self._show_countdown("3")
+        self.lbl_status.setText("Starting in 3...")
+        self.compact_status.setText("3")
+        self.countdown_timer.start()
+
+    def _show_countdown(self, text):
+        self.countdown_label.setText(text)
+        x = (self.view_stack.width() - self.countdown_label.width()) // 2
+        y = (self.view_stack.height() - self.countdown_label.height()) // 2
+        self.countdown_label.move(max(0, x), max(0, y))
+        self.countdown_label.raise_()
+        self.countdown_label.show()
+
+    def _update_countdown(self):
+        self.countdown_remaining -= 1
+        if self.countdown_remaining > 0:
+            text = str(self.countdown_remaining)
+            self._show_countdown(text)
+            self.lbl_status.setText(f"Starting in {text}...")
+            self.compact_status.setText(text)
+            return
+
+        self.countdown_timer.stop()
+        self.countdown_label.hide()
+        self.is_counting_down = False
+        self._begin_recording()
+
+    def _begin_recording(self):
         selected_audio = self.combo_audio.currentText()
         timestamp = int(time.time())
         output_filename = VIDEO_DIR / f"SCRAP_Recording_{timestamp}.mp4"
@@ -957,6 +1022,7 @@ class ScreenRecorderApp(QMainWindow):
                     or "Timed out opening the selected audio device."
                 )
                 self._cleanup_desktop_audio_temp()
+                self._restore_idle_controls()
                 QMessageBox.warning(self, "Audio Device Unavailable", error)
                 return
 
@@ -968,6 +1034,8 @@ class ScreenRecorderApp(QMainWindow):
 
         self.is_recording = True
         self._set_recording_controls_enabled(False)
+        self.btn_record.setEnabled(True)
+        self.btn_compact_record.setEnabled(True)
         self.record_start_time = time.monotonic()
         self.lbl_timer.setText("00:00:00:00.000")
         self.compact_timer.setText("00:00:00:00.000")
@@ -1153,6 +1221,7 @@ class ScreenRecorderApp(QMainWindow):
                 stderr=subprocess.PIPE,
                 text=True,
                 check=False,
+                **hidden_subprocess_kwargs(),
             )
             if mux_result.returncode != 0 or not muxed_file.exists():
                 self.lbl_status.setText("Audio mux failed")
@@ -1277,6 +1346,7 @@ class ScreenRecorderApp(QMainWindow):
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=stderr_log,
+            **hidden_subprocess_kwargs(),
         )
 
         while self.is_recording:
