@@ -16,6 +16,7 @@ import imageio_ffmpeg
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
+    QSplashScreen,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
@@ -36,14 +37,55 @@ try:
 except Exception:
     pass
 
-# All recordings should be saved to one canonical location only.
-VIDEO_DIR = Path.home() / "Videos" / "ScreenRecordings"
+def get_default_video_folder():
+    """Return the user's actual Windows Videos folder, including OneDrive redirects."""
+    if os.name == "nt":
+        try:
+            class GUID(ctypes.Structure):
+                _fields_ = [
+                    ("Data1", ctypes.c_ulong),
+                    ("Data2", ctypes.c_ushort),
+                    ("Data3", ctypes.c_ushort),
+                    ("Data4", ctypes.c_ubyte * 8),
+                ]
+
+            videos_guid = GUID()
+            # FOLDERID_Videos: {18989B1D-99B5-455B-841C-AB7C74E4DDFC}
+            values = "18989B1D99B5455B841CAB7C74E4DDFC"
+            videos_guid.Data1 = int(values[0:8], 16)
+            videos_guid.Data2 = int(values[8:12], 16)
+            videos_guid.Data3 = int(values[12:16], 16)
+            videos_guid.Data4[:] = bytes.fromhex(values[16:])
+
+            path_pointer = ctypes.c_wchar_p()
+            result = ctypes.windll.shell32.SHGetKnownFolderPath(
+                ctypes.byref(videos_guid), 0, None, ctypes.byref(path_pointer)
+            )
+            if result == 0 and path_pointer.value:
+                videos_folder = Path(path_pointer.value)
+                ctypes.windll.ole32.CoTaskMemFree(path_pointer)
+                return videos_folder
+        except Exception:
+            pass
+
+    return Path.home() / "Videos"
+
+
+# All recordings should be saved to the user's canonical Videos folder only.
+VIDEO_DIR = get_default_video_folder() / "ScreenRecordings"
 VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 
 CURRENT_TIER = "Pro"
 
 # Automatically resolve the bundled ffmpeg executable path
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def resource_path(relative_path):
+    """Resolve bundled resources both from source and from the PyInstaller app."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / relative_path
+    return Path(__file__).resolve().parent / relative_path
 
 
 class ActiveRecordingBorder(QWidget):
@@ -256,7 +298,7 @@ class ScreenRecorderApp(QMainWindow):
         self.setFont(QFont("Segoe UI", 10))
         self.video_encoder = self.detect_video_encoder()
 
-        icon_path = Path("assets") / "icon.png"
+        icon_path = resource_path("assets/icon.png")
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
 
@@ -1278,7 +1320,7 @@ class GalleryWindow(QWidget):
         self.setWindowTitle("SCRAP - Saved Recordings")
         self.setGeometry(200, 200, 440, 320)
 
-        icon_path = Path("assets") / "icon.png"
+        icon_path = resource_path("assets/icon.png")
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
 
@@ -1357,6 +1399,31 @@ class GalleryWindow(QWidget):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+
+    splash_icon_path = resource_path("assets/icon.png")
+    splash = None
+    if splash_icon_path.exists():
+        splash_pixmap = QPixmap(str(splash_icon_path)).scaled(
+            256,
+            256,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        splash = QSplashScreen(splash_pixmap)
+        splash.setWindowIcon(QIcon(str(splash_icon_path)))
+        splash.show()
+        app.processEvents()
+
     window = ScreenRecorderApp()
     window.show()
+    if splash is not None:
+        splash.finish(window)
+
+    if getattr(sys, "frozen", False):
+        try:
+            import pyi_splash
+            pyi_splash.close()
+        except (ImportError, AttributeError):
+            pass
+
     sys.exit(app.exec())
