@@ -505,11 +505,10 @@ class ScreenRecorderApp(QMainWindow):
 
         self.countdown_label = QLabel(self.view_stack)
         self.countdown_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.countdown_label.setFixedSize(140, 140)
+        self.countdown_label.setFixedSize(120, 120)
         self.countdown_label.setStyleSheet(
-            "background-color: rgba(28, 26, 25, 220);"
-            "border: 3px solid #ff5252; border-radius: 70px;"
-            "color: white; font-size: 72px; font-weight: bold;"
+            "background: transparent; border: none;"
+            "color: #ffffff; font-size: 96px; font-weight: bold;"
         )
         self.countdown_label.hide()
 
@@ -989,6 +988,7 @@ class ScreenRecorderApp(QMainWindow):
         self._begin_recording()
 
     def _begin_recording(self):
+        selected_q = self.combo_quality.currentText()
         selected_audio = self.combo_audio.currentText()
         timestamp = int(time.time())
         output_filename = VIDEO_DIR / f"SCRAP_Recording_{timestamp}.mp4"
