@@ -37,24 +37,20 @@ image.save(r'''$IconIco''', format='ICO', sizes=[(256, 256), (128, 128), (64, 64
 
 & $VenvPython -m PyInstaller --noconfirm --clean SCRAP.spec
 
-$PortableFolder = Join-Path $ProjectRoot "dist\SCRAP"
-$ExePath = Join-Path $PortableFolder "SCRAP.exe"
+$ExePath = Join-Path $ProjectRoot "dist\SCRAP.exe"
 if (-not (Test-Path $ExePath)) {
     throw "Build failed: SCRAP.exe was not created."
 }
 
-$StandaloneExe = Join-Path $ProjectRoot "dist\SCRAP.exe"
-if (Test-Path $StandaloneExe) {
-    Remove-Item $StandaloneExe -Force
-}
-
-$ReadmePath = Join-Path $PortableFolder "README.txt"
+$ReadmePath = Join-Path $ProjectRoot "dist\README.txt"
 @"
 SCRAP Screen Capture and Recording Platform
 
-1. Extract the complete SCRAP folder.
-2. Keep SCRAP.exe and the _internal folder together.
-3. Run SCRAP.exe. No Python installation is required.
+1. Extract SCRAP.exe and README.txt from this zip.
+2. Run SCRAP.exe. No Python installation or setup is required.
+
+SCRAP.exe is a self-contained portable application. It may create a temporary
+runtime folder while starting, then remove it when closed.
 
 Recordings are saved automatically under the current user's Videos folder:
 Videos\ScreenRecordings
@@ -62,21 +58,18 @@ Videos\ScreenRecordings
 Windows may show SmartScreen or antivirus warnings for an unsigned app.
 "@ | Set-Content -Path $ReadmePath -Encoding ASCII
 
+$PackageFolder = Join-Path $ProjectRoot "dist\SCRAP-Portable"
+if (Test-Path $PackageFolder) {
+    Remove-Item $PackageFolder -Recurse -Force
+}
+New-Item -ItemType Directory -Path $PackageFolder | Out-Null
+Copy-Item $ExePath -Destination $PackageFolder
+Copy-Item $ReadmePath -Destination $PackageFolder
+
 $ZipPath = Join-Path $ProjectRoot "dist\SCRAP-Portable.zip"
 if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
 Start-Sleep -Seconds 2
-Compress-Archive -Path $PortableFolder -DestinationPath $ZipPath -CompressionLevel Optimal
+Compress-Archive -Path (Join-Path $PackageFolder "*") -DestinationPath $ZipPath -CompressionLevel Optimal
 
-$DesktopPath = [Environment]::GetFolderPath("Desktop")
-$ShortcutPath = Join-Path $DesktopPath "SCRAP.lnk"
-$Shell = New-Object -ComObject WScript.Shell
-$Shortcut = $Shell.CreateShortcut($ShortcutPath)
-$Shortcut.TargetPath = $ExePath
-$Shortcut.WorkingDirectory = Split-Path -Parent $ExePath
-$Shortcut.IconLocation = $IconIco
-$Shortcut.Description = "SCRAP Screen Capture & Recording Platform"
-$Shortcut.Save()
-
-Write-Host "Portable app built at: $ExePath"
+Write-Host "Portable app: $ExePath"
 Write-Host "Distribution package: $ZipPath"
-Write-Host "Desktop shortcut created at: $ShortcutPath"

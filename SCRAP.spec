@@ -65,13 +65,14 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    [],
+    a.binaries,
+    a.datas,
     name="SCRAP",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    exclude_binaries=True,
+    upx_exclude=[],
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -79,14 +80,4 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=[str(icon_path)] if icon_path.exists() else None,
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name="SCRAP",
 )

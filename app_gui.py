@@ -1470,16 +1470,20 @@ class GalleryWindow(QWidget):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
-    splash_icon_path = resource_path("assets/icon.png")
+    splash_icon_path = resource_path("assets/splash.png")
     splash = None
     if splash_icon_path.exists():
         splash_pixmap = QPixmap(str(splash_icon_path)).scaled(
-            256,
-            256,
+            220,
+            220,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        splash = QSplashScreen(splash_pixmap)
+        splash = QSplashScreen(
+            splash_pixmap,
+            Qt.WindowType.SplashScreen | Qt.WindowType.FramelessWindowHint,
+        )
+        splash.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         splash.setWindowIcon(QIcon(str(splash_icon_path)))
         splash.show()
         app.processEvents()
