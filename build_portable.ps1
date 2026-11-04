@@ -37,18 +37,24 @@ image.save(r'''$IconIco''', format='ICO', sizes=[(256, 256), (128, 128), (64, 64
 
 & $VenvPython -m PyInstaller --noconfirm --clean SCRAP.spec
 
-$ExePath = Join-Path $ProjectRoot "dist\SCRAP\SCRAP.exe"
+$PortableFolder = Join-Path $ProjectRoot "dist\SCRAP"
+$ExePath = Join-Path $PortableFolder "SCRAP.exe"
 if (-not (Test-Path $ExePath)) {
     throw "Build failed: SCRAP.exe was not created."
 }
 
-$ReadmePath = Join-Path $ProjectRoot "dist\SCRAP\README.txt"
+$StandaloneExe = Join-Path $ProjectRoot "dist\SCRAP.exe"
+if (Test-Path $StandaloneExe) {
+    Remove-Item $StandaloneExe -Force
+}
+
+$ReadmePath = Join-Path $PortableFolder "README.txt"
 @"
 SCRAP Screen Capture and Recording Platform
 
-1. Extract this entire SCRAP folder.
+1. Extract the complete SCRAP folder.
 2. Keep SCRAP.exe and the _internal folder together.
-3. Run SCRAP.exe.
+3. Run SCRAP.exe. No Python installation is required.
 
 Recordings are saved automatically under the current user's Videos folder:
 Videos\ScreenRecordings
@@ -58,14 +64,8 @@ Windows may show SmartScreen or antivirus warnings for an unsigned app.
 
 $ZipPath = Join-Path $ProjectRoot "dist\SCRAP-Portable.zip"
 if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-$PortableFolder = Join-Path $ProjectRoot "dist\SCRAP"
-[IO.Compression.ZipFile]::CreateFromDirectory(
-    $PortableFolder,
-    $ZipPath,
-    [IO.Compression.CompressionLevel]::Optimal,
-    $false
-)
+Start-Sleep -Seconds 2
+Compress-Archive -Path $PortableFolder -DestinationPath $ZipPath -CompressionLevel Optimal
 
 $DesktopPath = [Environment]::GetFolderPath("Desktop")
 $ShortcutPath = Join-Path $DesktopPath "SCRAP.lnk"

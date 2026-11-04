@@ -66,12 +66,12 @@ exe = EXE(
     pyz,
     a.scripts,
     [],
-    exclude_binaries=True,
     name="SCRAP",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
+    exclude_binaries=True,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -80,6 +80,7 @@ exe = EXE(
     entitlements_file=None,
     icon=[str(icon_path)] if icon_path.exists() else None,
 )
+
 coll = COLLECT(
     exe,
     a.binaries,
