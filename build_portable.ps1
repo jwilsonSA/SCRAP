@@ -3,6 +3,11 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
 
+$BuildFolder = Join-Path $ProjectRoot "build"
+$DistFolder = Join-Path $ProjectRoot "dist"
+if (Test-Path $BuildFolder) { Remove-Item $BuildFolder -Recurse -Force }
+if (Test-Path $DistFolder) { Remove-Item $DistFolder -Recurse -Force }
+
 $VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $Python = $VenvPython
 if (-not (Test-Path $Python)) {
