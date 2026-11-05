@@ -320,11 +320,15 @@ class ScreenRecorderApp(QMainWindow):
         self.area_region = None
         self.active_border = None
         self.record_start_time = None
+        self.record_pause_started_at = None
+        self.record_paused_duration = 0.0
+        self.is_paused = False
         self.ffmpeg_process = None
         self.ffmpeg_returncode = None
         self.audio_capture_stop = None
         self.audio_capture_thread = None
         self.audio_capture_error = None
+        self.audio_capture_pause = None
         self.audio_temp_path = None
         self.ffmpeg_error_output = ""
         self.current_output_file = None
@@ -461,10 +465,19 @@ class ScreenRecorderApp(QMainWindow):
         self.btn_record.setObjectName("RecordButton")
         self.btn_record.setFixedSize(110, 110)
         self.btn_record.clicked.connect(self.toggle_recording)
+        self.btn_pause = QPushButton("Ⅱ\nPause")
+        self.btn_pause.setObjectName("PauseButton")
+        self.btn_pause.setFixedSize(110, 110)
+        self.btn_pause.clicked.connect(self.toggle_pause_recording)
+        self.btn_pause.setEnabled(False)
 
         right_layout.addWidget(self.lbl_timer, alignment=Qt.AlignmentFlag.AlignCenter)
         right_layout.addWidget(self.lbl_status, alignment=Qt.AlignmentFlag.AlignCenter)
-        right_layout.addWidget(self.btn_record, alignment=Qt.AlignmentFlag.AlignCenter)
+        record_buttons_layout = QHBoxLayout()
+        record_buttons_layout.setSpacing(8)
+        record_buttons_layout.addWidget(self.btn_record)
+        record_buttons_layout.addWidget(self.btn_pause)
+        right_layout.addLayout(record_buttons_layout)
         main_layout.addLayout(right_layout, stretch=1)
         main_view_layout.addLayout(main_layout, stretch=1)
 
@@ -487,6 +500,13 @@ class ScreenRecorderApp(QMainWindow):
         self.btn_compact_record.setToolTip("Start recording")
         self.btn_compact_record.setAccessibleName("Start recording")
         self.btn_compact_record.clicked.connect(self.toggle_recording)
+        self.btn_compact_pause = QPushButton("Ⅱ")
+        self.btn_compact_pause.setObjectName("CompactPauseButton")
+        self.btn_compact_pause.setFixedSize(34, 34)
+        self.btn_compact_pause.setToolTip("Pause recording")
+        self.btn_compact_pause.setAccessibleName("Pause recording")
+        self.btn_compact_pause.clicked.connect(self.toggle_pause_recording)
+        self.btn_compact_pause.setEnabled(False)
         self.btn_expand = QPushButton()
         self.btn_expand.setObjectName("CompactToggle")
         self.btn_expand.setFixedSize(28, 28)
@@ -499,6 +519,7 @@ class ScreenRecorderApp(QMainWindow):
         compact_layout.addWidget(self.compact_status)
         compact_layout.addWidget(self.compact_timer, stretch=1)
         compact_layout.addWidget(self.btn_compact_record)
+        compact_layout.addWidget(self.btn_compact_pause)
         compact_layout.addWidget(self.btn_expand)
         self.view_stack.addWidget(self.compact_view)
         self.setCentralWidget(self.view_stack)
@@ -696,12 +717,21 @@ class ScreenRecorderApp(QMainWindow):
 
     def _restore_idle_controls(self):
         self._set_recording_controls_enabled(True)
+        self.is_paused = False
+        self.record_pause_started_at = None
+        self.record_paused_duration = 0.0
         self.btn_record.setEnabled(True)
+        self.btn_pause.setText("Ⅱ\nPause")
+        self.btn_pause.setEnabled(False)
         self.btn_compact_record.setIcon(self._make_record_icon(False))
         self.btn_compact_record.setToolTip("Start recording")
         self.btn_compact_record.setAccessibleName("Start recording")
         self.btn_compact_record.setStyleSheet("")
         self.btn_compact_record.setEnabled(True)
+        self.btn_compact_pause.setText("Ⅱ")
+        self.btn_compact_pause.setToolTip("Pause recording")
+        self.btn_compact_pause.setAccessibleName("Pause recording")
+        self.btn_compact_pause.setEnabled(False)
         self.compact_status.setText("Ready")
 
     def _cleanup_desktop_audio_temp(self):
@@ -840,11 +870,77 @@ class ScreenRecorderApp(QMainWindow):
         else:
             self.stop_recording()
 
+    def _suspend_ffmpeg_process(self):
+        process = self.ffmpeg_process
+        if os.name != "nt" or process is None or process.poll() is not None:
+            return
+        process_handle = ctypes.windll.kernel32.OpenProcess(
+            0x0800, False, process.pid
+        )
+        if process_handle:
+            try:
+                ctypes.windll.ntdll.NtSuspendProcess(process_handle)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(process_handle)
+
+    def _resume_ffmpeg_process(self):
+        process = self.ffmpeg_process
+        if os.name != "nt" or process is None or process.poll() is not None:
+            return
+        process_handle = ctypes.windll.kernel32.OpenProcess(
+            0x0800, False, process.pid
+        )
+        if process_handle:
+            try:
+                ctypes.windll.ntdll.NtResumeProcess(process_handle)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(process_handle)
+
+    def toggle_pause_recording(self):
+        if not self.is_recording:
+            return
+
+        if not self.is_paused:
+            if self.audio_capture_pause is not None:
+                self.audio_capture_pause.set()
+            self._suspend_ffmpeg_process()
+            self.is_paused = True
+            self.record_pause_started_at = time.monotonic()
+            self.lbl_status.setText("Paused")
+            self.compact_status.setText("Paused")
+            self.btn_pause.setText("▶\nResume")
+            self.btn_compact_pause.setText("▶")
+            self.btn_compact_pause.setToolTip("Resume recording")
+            self.btn_compact_pause.setAccessibleName("Resume recording")
+        else:
+            if self.record_pause_started_at is not None:
+                self.record_paused_duration += (
+                    time.monotonic() - self.record_pause_started_at
+                )
+            self.record_pause_started_at = None
+            if self.audio_capture_pause is not None:
+                self.audio_capture_pause.clear()
+            self._resume_ffmpeg_process()
+            self.is_paused = False
+            self.lbl_status.setText("Recording...")
+            self.compact_status.setText("REC")
+            self.btn_pause.setText("Ⅱ\nPause")
+            self.btn_compact_pause.setText("Ⅱ")
+            self.btn_compact_pause.setToolTip("Pause recording")
+            self.btn_compact_pause.setAccessibleName("Pause recording")
+
     def update_record_timer(self):
         if self.record_start_time is None:
             return
 
-        elapsed = time.monotonic() - self.record_start_time
+        elapsed_end = (
+            self.record_pause_started_at
+            if self.record_pause_started_at is not None
+            else time.monotonic()
+        )
+        elapsed = (
+            elapsed_end - self.record_start_time - self.record_paused_duration
+        )
         total_ms = int(elapsed * 1000)
         days, remainder = divmod(total_ms, 86400000)
         hours, remainder = divmod(remainder, 3600000)
@@ -1002,6 +1098,7 @@ class ScreenRecorderApp(QMainWindow):
             ) as audio_temp:
                 self.audio_temp_path = Path(audio_temp.name)
             self.audio_capture_stop = threading.Event()
+            self.audio_capture_pause = threading.Event()
             audio_ready = threading.Event()
             self.audio_capture_error = None
             self.audio_capture_thread = threading.Thread(
@@ -1011,6 +1108,7 @@ class ScreenRecorderApp(QMainWindow):
                     self.audio_capture_stop,
                     audio_ready,
                     selected_audio,
+                    self.audio_capture_pause,
                 ),
             )
             self.audio_capture_thread.start()
@@ -1033,10 +1131,16 @@ class ScreenRecorderApp(QMainWindow):
             crop_control_port = self._start_area_crop_control()
 
         self.is_recording = True
+        self.is_paused = False
         self._set_recording_controls_enabled(False)
         self.btn_record.setEnabled(True)
         self.btn_compact_record.setEnabled(True)
+        self.btn_pause.setEnabled(True)
+        self.btn_compact_pause.setEnabled(True)
         self.record_start_time = time.monotonic()
+        self.record_pause_started_at = None
+        self.record_paused_duration = 0.0
+        self.is_paused = False
         self.lbl_timer.setText("00:00:00:00.000")
         self.compact_timer.setText("00:00:00:00.000")
         self.lbl_status.setText("Recording...")
@@ -1062,7 +1166,9 @@ class ScreenRecorderApp(QMainWindow):
         )
         self.rec_thread.start()
 
-    def capture_audio_source(self, output_file, stop_event, ready_event, audio_source):
+    def capture_audio_source(
+        self, output_file, stop_event, ready_event, audio_source, pause_event
+    ):
         try:
             import soundcard
 
@@ -1114,7 +1220,14 @@ class ScreenRecorderApp(QMainWindow):
                     channels=list(range(channels)),
                     blocksize=24000,
                 ) as recorder:
+                    paused_since_resumed = False
                     while not stop_event.is_set():
+                        if pause_event.wait(timeout=0.05):
+                            paused_since_resumed = True
+                            continue
+                        if paused_since_resumed:
+                            recorder.record(numframes=4800)
+                            paused_since_resumed = False
                         samples = recorder.record(numframes=4800)
                         pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
                         audio_file.writeframesraw(pcm.tobytes())
@@ -1128,6 +1241,12 @@ class ScreenRecorderApp(QMainWindow):
         if self.active_border is not None:
             self.active_border.close()
             self.active_border = None
+
+        if self.is_paused:
+            if self.audio_capture_pause is not None:
+                self.audio_capture_pause.clear()
+            self._resume_ffmpeg_process()
+            self.is_paused = False
 
         self.is_recording = False
         self._stop_area_crop_control()
@@ -1143,9 +1262,15 @@ class ScreenRecorderApp(QMainWindow):
         self.btn_record.setText("🔴\nRecord")
         self.btn_record.setStyleSheet("")
         self.btn_record.setEnabled(False)
+        self.btn_pause.setText("Ⅱ\nPause")
+        self.btn_pause.setEnabled(False)
         self.btn_compact_record.setIcon(self._make_record_icon(False))
         self.btn_compact_record.setToolTip("Finalizing recording")
         self.btn_compact_record.setEnabled(False)
+        self.btn_compact_pause.setText("Ⅱ")
+        self.btn_compact_pause.setToolTip("Pause recording")
+        self.btn_compact_pause.setAccessibleName("Pause recording")
+        self.btn_compact_pause.setEnabled(False)
         self.apply_styles()
 
         if hasattr(self, "rec_thread") and self.rec_thread.is_alive():
@@ -1342,6 +1467,8 @@ class ScreenRecorderApp(QMainWindow):
             stderr=stderr_log,
             **hidden_subprocess_kwargs(),
         )
+        if self.is_paused:
+            self._suspend_ffmpeg_process()
 
         while self.is_recording:
             time.sleep(0.05)
