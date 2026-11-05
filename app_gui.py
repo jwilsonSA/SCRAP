@@ -1003,7 +1003,79 @@ class ScreenRecorderApp(QMainWindow):
                 return encoder
         return "libx264"
 
+    @staticmethod
+    def _normalize_audio_device_name(name):
+        if not name:
+            return ""
+        normalized = re.sub(r"[^a-z0-9]+", "", str(name).lower())
+        for prefix in ("microphone", "speakers", "headphones", "output", "input"):
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix):]
+                break
+        return normalized or re.sub(r"[^a-z0-9]+", "", str(name).lower())
+
+    def _find_soundcard_microphone(self, devices, requested_name=None):
+        if not devices:
+            return None
+        if requested_name:
+            exact = [
+                device
+                for device in devices
+                if device.name.strip().lower() == requested_name.strip().lower()
+            ]
+            if exact:
+                return exact[0]
+
+            requested_key = self._normalize_audio_device_name(requested_name)
+            normalized = [
+                device
+                for device in devices
+                if self._normalize_audio_device_name(device.name) == requested_key
+                and requested_key
+            ]
+            if normalized:
+                return normalized[0]
+
+            requested_key = requested_key.casefold()
+            partial = [
+                device
+                for device in devices
+                if requested_key
+                and (
+                    requested_key
+                    in self._normalize_audio_device_name(device.name).casefold()
+                    or self._normalize_audio_device_name(device.name).casefold()
+                    in requested_key
+                )
+            ]
+            if partial:
+                return partial[0]
+        return None
+
     def discover_audio_devices(self):
+        try:
+            import soundcard
+
+            devices = []
+            seen = set()
+            for microphone in soundcard.all_microphones(include_loopback=True):
+                if microphone.isloopback:
+                    continue
+                name = str(getattr(microphone, "name", "")).strip()
+                key = self._normalize_audio_device_name(name)
+                if name and key and key not in seen:
+                    seen.add(key)
+                    devices.append(name)
+            if devices:
+                return [
+                    "No Audio",
+                    "Desktop Audio",
+                    "Desktop + Microphone",
+                    *devices,
+                ]
+        except Exception:
+            pass
+
         try:
             ffmpeg_cmd = [
                 FFMPEG_EXE,
@@ -1201,9 +1273,9 @@ class ScreenRecorderApp(QMainWindow):
                     input_devices[0],
                 )
             else:
-                microphone = next(
-                    (device for device in input_devices if device.name == audio_source),
-                    None,
+                microphone = self._find_soundcard_microphone(
+                    input_devices,
+                    audio_source,
                 )
                 if microphone is None:
                     raise RuntimeError(
@@ -1234,13 +1306,12 @@ class ScreenRecorderApp(QMainWindow):
                 if microphone is None:
                     microphone = microphones[0]
                 else:
-                    microphone = next(
-                        (
-                            device
-                            for device in microphones
-                            if device.name == microphone.name
-                        ),
-                        microphones[0],
+                    microphone = (
+                        self._find_soundcard_microphone(
+                            microphones,
+                            microphone.name,
+                        )
+                        or microphones[0]
                     )
 
                 default_speaker = soundcard.default_speaker()
@@ -1307,9 +1378,9 @@ class ScreenRecorderApp(QMainWindow):
                                 desktop_mono.shape[0], microphone_mono.shape[0]
                             )
                             mixed = (
-                                desktop_mono[:frame_count]
-                                + microphone_mono[:frame_count]
-                            ) * 0.5
+                                desktop_mono[:frame_count] * 0.65
+                                + microphone_mono[:frame_count] * 0.85
+                            )
                             mixed = np.clip(mixed, -1.0, 1.0)
                             pcm_mono = (
                                 mixed * 32767
