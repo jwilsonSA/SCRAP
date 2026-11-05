@@ -2,7 +2,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scrap.capture.audio import normalize_audio_device_name
+from scrap.capture.audio import (
+    get_audio_capture_stats,
+    normalize_audio_device_name,
+)
 from scrap.capture.recording import build_capture_command, resolve_target_size
 from scrap.platform import resource_path
 
@@ -18,6 +21,14 @@ class RecordingServiceTests(unittest.TestCase):
         self.assertEqual(normalize_audio_device_name("Microphone (Realtek)"), "realtek")
         self.assertEqual(normalize_audio_device_name("Speakers (USB)"), "usb")
         self.assertEqual(normalize_audio_device_name(""), "")
+
+    def test_empty_audio_capture_stats(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            missing = Path(temp_dir) / "missing.wav"
+            stats = get_audio_capture_stats(missing)
+            self.assertEqual(stats["frame_count"], 0)
+            self.assertEqual(stats["duration"], 0.0)
+            self.assertEqual(stats["peak"], 0)
 
     def test_build_full_screen_command(self):
         with tempfile.TemporaryDirectory() as temp_dir:

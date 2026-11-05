@@ -107,6 +107,42 @@ def discover_audio_devices():
     return ["No Audio", "Desktop Audio", "Desktop + Microphone"]
 
 
+def get_audio_capture_stats(output_file):
+    try:
+        with wave.open(str(output_file), "rb") as audio_file:
+            frame_count = audio_file.getnframes()
+            channels = audio_file.getnchannels()
+            sample_width = audio_file.getsampwidth()
+            sample_rate = audio_file.getframerate()
+            duration = frame_count / sample_rate if sample_rate else 0.0
+            peak = 0
+            while True:
+                frames = audio_file.readframes(48000)
+                if not frames:
+                    break
+                if sample_width == 2:
+                    samples = np.frombuffer(frames, dtype=np.int16)
+                    if samples.size:
+                        peak = max(peak, int(np.max(np.abs(samples.astype(np.int32)))))
+            return {
+                "frame_count": frame_count,
+                "channels": channels,
+                "sample_width": sample_width,
+                "sample_rate": sample_rate,
+                "duration": duration,
+                "peak": peak,
+            }
+    except (OSError, EOFError, wave.Error):
+        return {
+            "frame_count": 0,
+            "channels": 0,
+            "sample_width": 0,
+            "sample_rate": 0,
+            "duration": 0.0,
+            "peak": 0,
+        }
+
+
 def capture_audio_source(
     output_file,
     stop_event,
@@ -114,6 +150,7 @@ def capture_audio_source(
     audio_source,
     pause_event,
     error_callback=None,
+    level_callback=None,
 ):
     try:
         import soundcard
@@ -236,10 +273,12 @@ def capture_audio_source(
                         pcm_mono = (mixed * 32767).astype(np.int16)
                         pcm = np.column_stack((pcm_mono, pcm_mono))
                         audio_file.writeframesraw(pcm.tobytes())
+                        if level_callback:
+                            level_callback(float(np.max(np.abs(mixed))))
                         ready_event.set()
             return
 
-        channels = min(microphone.channels, 2)
+        channels = max(1, min(microphone.channels, 2))
         with wave.open(str(output_file), "wb") as audio_file:
             audio_file.setnchannels(channels)
             audio_file.setsampwidth(2)
@@ -260,6 +299,16 @@ def capture_audio_source(
                     samples = recorder.record(numframes=4800)
                     pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
                     audio_file.writeframesraw(pcm.tobytes())
+                    if level_callback:
+                        level_callback(
+                            float(
+                                np.max(
+                                    np.abs(
+                                        np.asarray(samples, dtype=np.float32)
+                                    )
+                                )
+                            )
+                        )
                     ready_event.set()
     except Exception as exc:
         if error_callback:

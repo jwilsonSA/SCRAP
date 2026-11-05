@@ -80,6 +80,8 @@ class ScreenRecorderApp(AreaCropControlMixin, QMainWindow):
         self.mux_thread = None
         self.mux_worker = None
         self.active_audio_source = "No Audio"
+        self.audio_level = 0.0
+        self.audio_level_updated_at = 0.0
         self.is_compact_mode = False
         self.area_crop_port = None
         self.area_crop_stop = None
@@ -187,6 +189,18 @@ class ScreenRecorderApp(AreaCropControlMixin, QMainWindow):
 
         audio_layout.addWidget(self.lbl_audio)
         audio_layout.addWidget(self.combo_audio)
+        self.audio_meter_lamps = []
+        for color_name in ("green", "yellow", "red"):
+            lamp = QLabel()
+            lamp.setFixedSize(12, 12)
+            lamp.setToolTip(f"{color_name.title()} audio level")
+            lamp.setAccessibleName(f"{color_name.title()} audio level")
+            lamp.setStyleSheet(
+                "border-radius: 6px; border: 1px solid #655f5c; "
+                "background-color: #292625;"
+            )
+            self.audio_meter_lamps.append(lamp)
+            audio_layout.addWidget(lamp)
         left_layout.addLayout(audio_layout)
 
         self.btn_gallery = QPushButton("📂 View Saved Recordings")
@@ -467,6 +481,9 @@ class ScreenRecorderApp(AreaCropControlMixin, QMainWindow):
         self.is_paused = False
         self.record_pause_started_at = None
         self.record_paused_duration = 0.0
+        self.audio_level = 0.0
+        self.audio_level_updated_at = 0.0
+        self._set_audio_meter_level(0.0)
         self.btn_record.setEnabled(True)
         self.btn_pause.setText("Ⅱ\nPause")
         self.btn_pause.setEnabled(False)
@@ -495,6 +512,34 @@ class ScreenRecorderApp(AreaCropControlMixin, QMainWindow):
 
     def _set_audio_capture_error(self, error):
         self.audio_capture_error = str(error)
+
+    def _set_audio_level(self, level):
+        try:
+            level = float(level)
+        except (TypeError, ValueError):
+            level = 0.0
+        self.audio_level = max(0.0, min(1.0, level))
+        self.audio_level_updated_at = time.monotonic()
+
+    def _set_audio_meter_level(self, level):
+        colors = ("#48d67b", "#f4c542", "#ff5a5a")
+        inactive = "#292625"
+        level = max(0.0, min(1.0, level))
+        if self.active_audio_source == "No Audio" or level < 0.01:
+            active_count = 0
+        elif level < 0.25:
+            active_count = 1
+        elif level < 0.65:
+            active_count = 2
+        else:
+            active_count = 3
+
+        for index, lamp in enumerate(self.audio_meter_lamps):
+            background = colors[index] if index < active_count else inactive
+            lamp.setStyleSheet(
+                "border-radius: 6px; border: 1px solid #655f5c; "
+                f"background-color: {background};"
+            )
 
     def on_area_selected(self, region):
         with mss.MSS() as sct:
@@ -565,6 +610,8 @@ class ScreenRecorderApp(AreaCropControlMixin, QMainWindow):
             self._suspend_ffmpeg_process()
             self.is_paused = True
             self.record_pause_started_at = time.monotonic()
+            self.audio_level = 0.0
+            self._set_audio_meter_level(0.0)
             self.lbl_status.setText("Paused")
             self.compact_status.setText("Paused")
             self.btn_pause.setText("▶\nResume")
@@ -589,6 +636,12 @@ class ScreenRecorderApp(AreaCropControlMixin, QMainWindow):
             self.btn_compact_pause.setAccessibleName("Pause recording")
 
     def update_record_timer(self):
+        if (
+            self.audio_level_updated_at
+            and time.monotonic() - self.audio_level_updated_at > 0.25
+        ):
+            self.audio_level = 0.0
+        self._set_audio_meter_level(self.audio_level)
         if self.record_start_time is None:
             return
 
@@ -673,6 +726,9 @@ class ScreenRecorderApp(AreaCropControlMixin, QMainWindow):
         self.current_output_file = output_filename
         self.active_audio_source = selected_audio
         self.ffmpeg_returncode = None
+        self.audio_level = 0.0
+        self.audio_level_updated_at = 0.0
+        self._set_audio_meter_level(0.0)
 
         if selected_audio != "No Audio":
             with tempfile.NamedTemporaryFile(
@@ -692,7 +748,10 @@ class ScreenRecorderApp(AreaCropControlMixin, QMainWindow):
                     selected_audio,
                     self.audio_capture_pause,
                 ),
-                kwargs={"error_callback": self._set_audio_capture_error},
+                kwargs={
+                    "error_callback": self._set_audio_capture_error,
+                    "level_callback": self._set_audio_level,
+                },
             )
             self.audio_capture_thread.start()
             if not audio_ready.wait(timeout=10) or self.audio_capture_error:
