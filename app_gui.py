@@ -1,18 +1,13 @@
 import sys
 import os
-import re
-import socket
 import time
 import threading
 import subprocess
 import ctypes
 import tempfile
-import wave
 from pathlib import Path
 
-import numpy as np
 import mss
-import imageio_ffmpeg
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -23,12 +18,27 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QComboBox,
     QLabel,
-    QListWidget,
     QMessageBox,
     QStackedWidget,
 )
-from PyQt6.QtGui import QIcon, QColor, QPainter, QPen, QFont, QPixmap, QRegion
-from PyQt6.QtCore import Qt, QRect, QSize, QTimer
+from PyQt6.QtGui import QIcon, QColor, QPainter, QPen, QFont, QPixmap
+from PyQt6.QtCore import Qt, QRect, QSize, QTimer, QThread
+
+from scrap.config import CURRENT_TIER, VIDEO_DIR
+from scrap.platform import hidden_subprocess_kwargs, resource_path
+from scrap.capture.audio import (
+    capture_audio_source as capture_audio_worker,
+    discover_audio_devices,
+)
+from scrap.capture.mux import MuxWorker
+from scrap.capture.recording import (
+    build_capture_command,
+    detect_video_encoder as detect_video_encoder_service,
+    resolve_target_size as resolve_target_size_service,
+)
+from scrap.capture.area import AreaCropControlMixin
+from scrap.ui.gallery import GalleryWindow
+from scrap.ui.overlays import ActiveRecordingBorder, ScreenSelectorOverlay
 
 # Register AppUserModelID for taskbar icon handling on Windows
 try:
@@ -37,272 +47,7 @@ try:
 except Exception:
     pass
 
-def get_default_video_folder():
-    """Return the user's actual Windows Videos folder, including OneDrive redirects."""
-    if os.name == "nt":
-        try:
-            class GUID(ctypes.Structure):
-                _fields_ = [
-                    ("Data1", ctypes.c_ulong),
-                    ("Data2", ctypes.c_ushort),
-                    ("Data3", ctypes.c_ushort),
-                    ("Data4", ctypes.c_ubyte * 8),
-                ]
-
-            videos_guid = GUID()
-            # FOLDERID_Videos: {18989B1D-99B5-455B-841C-AB7C74E4DDFC}
-            values = "18989B1D99B5455B841CAB7C74E4DDFC"
-            videos_guid.Data1 = int(values[0:8], 16)
-            videos_guid.Data2 = int(values[8:12], 16)
-            videos_guid.Data3 = int(values[12:16], 16)
-            videos_guid.Data4[:] = bytes.fromhex(values[16:])
-
-            path_pointer = ctypes.c_wchar_p()
-            result = ctypes.windll.shell32.SHGetKnownFolderPath(
-                ctypes.byref(videos_guid), 0, None, ctypes.byref(path_pointer)
-            )
-            if result == 0 and path_pointer.value:
-                videos_folder = Path(path_pointer.value)
-                ctypes.windll.ole32.CoTaskMemFree(path_pointer)
-                return videos_folder
-        except Exception:
-            pass
-
-    return Path.home() / "Videos"
-
-
-# All recordings should be saved to the user's canonical Videos folder only.
-VIDEO_DIR = get_default_video_folder() / "ScreenRecordings"
-VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-
-CURRENT_TIER = "Pro"
-
-# Automatically resolve the bundled ffmpeg executable path
-FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
-
-
-def hidden_subprocess_kwargs():
-    """Prevent Windows console windows from appearing for FFmpeg helpers."""
-    if os.name != "nt":
-        return {}
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    startupinfo.wShowWindow = subprocess.SW_HIDE
-    return {
-        "creationflags": subprocess.CREATE_NO_WINDOW,
-        "startupinfo": startupinfo,
-    }
-
-
-def resource_path(relative_path):
-    """Resolve bundled resources both from source and from the PyInstaller app."""
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        return Path(sys._MEIPASS) / relative_path
-    return Path(__file__).resolve().parent / relative_path
-
-
-class ActiveRecordingBorder(QWidget):
-    """Interactive area frame with its visible outline outside the crop."""
-
-    MARGIN = 12
-    MIN_SIZE = 64
-
-    def __init__(self, region, bounds, on_change):
-        super().__init__()
-        self.region = dict(region)
-        self.bounds = bounds
-        self.on_change = on_change
-        self.drag_handle = None
-        self.drag_start = None
-        self.drag_region = None
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setMouseTracking(True)
-        self.update_region(region)
-
-    def update_region(self, region):
-        self.region = dict(region)
-        margin = self.MARGIN
-        self.setGeometry(
-            self.region["left"] - margin,
-            self.region["top"] - margin,
-            self.region["width"] + margin * 2,
-            self.region["height"] + margin * 2,
-        )
-        selection = QRect(margin, margin, self.region["width"], self.region["height"])
-        self.setMask(QRegion(self.rect()).subtracted(QRegion(selection)))
-        self.update()
-
-    def _hit_test(self, pos):
-        margin = self.MARGIN
-        left = pos.x() < margin
-        right = pos.x() >= margin + self.region["width"]
-        top = pos.y() < margin
-        bottom = pos.y() >= margin + self.region["height"]
-
-        if top and left:
-            return "top_left"
-        if top and right:
-            return "top_right"
-        if bottom and left:
-            return "bottom_left"
-        if bottom and right:
-            return "bottom_right"
-        if top:
-            return "move"
-        if bottom:
-            return "bottom"
-        if left:
-            return "left"
-        if right:
-            return "right"
-        return None
-
-    def mousePressEvent(self, event):
-        self.drag_handle = self._hit_test(event.position().toPoint())
-        self.drag_start = event.globalPosition().toPoint()
-        self.drag_region = dict(self.region)
-        event.accept()
-
-    def mouseMoveEvent(self, event):
-        if self.drag_handle is None:
-            handle = self._hit_test(event.position().toPoint())
-            if handle == "move":
-                cursor = Qt.CursorShape.SizeAllCursor
-            elif handle in ("left", "right"):
-                cursor = Qt.CursorShape.SizeHorCursor
-            elif handle in ("top", "bottom"):
-                cursor = Qt.CursorShape.SizeVerCursor
-            elif handle in ("top_left", "bottom_right"):
-                cursor = Qt.CursorShape.SizeFDiagCursor
-            elif handle in ("top_right", "bottom_left"):
-                cursor = Qt.CursorShape.SizeBDiagCursor
-            else:
-                cursor = Qt.CursorShape.ArrowCursor
-            self.setCursor(cursor)
-            return
-
-        current = event.globalPosition().toPoint()
-        delta_x = current.x() - self.drag_start.x()
-        delta_y = current.y() - self.drag_start.y()
-        original = self.drag_region
-        left = original["left"]
-        top = original["top"]
-        right = left + original["width"]
-        bottom = top + original["height"]
-
-        if self.drag_handle == "move":
-            left += delta_x
-            top += delta_y
-            right += delta_x
-            bottom += delta_y
-        else:
-            if "left" in self.drag_handle:
-                left = min(left + delta_x, right - self.MIN_SIZE)
-            if "right" in self.drag_handle:
-                right = max(right + delta_x, left + self.MIN_SIZE)
-            if "top" in self.drag_handle:
-                top = min(top + delta_y, bottom - self.MIN_SIZE)
-            if "bottom" in self.drag_handle:
-                bottom = max(bottom + delta_y, top + self.MIN_SIZE)
-
-        bounds_right = self.bounds["left"] + self.bounds["width"]
-        bounds_bottom = self.bounds["top"] + self.bounds["height"]
-        width = min(right - left, bounds_right - self.bounds["left"])
-        height = min(bottom - top, bounds_bottom - self.bounds["top"])
-        left = max(self.bounds["left"], min(left, bounds_right - width))
-        top = max(self.bounds["top"], min(top, bounds_bottom - height))
-        width -= width % 2
-        height -= height % 2
-        region = {"left": left, "top": top, "width": width, "height": height}
-        self.update_region(region)
-        self.on_change(region)
-
-    def mouseReleaseEvent(self, event):
-        self.drag_handle = None
-        self.drag_start = None
-        self.drag_region = None
-        event.accept()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor(255, 54, 68), 3))
-        margin = self.MARGIN
-        painter.drawRect(
-            QRect(
-                margin - 2,
-                margin - 2,
-                self.region["width"] + 3,
-                self.region["height"] + 3,
-            )
-        )
-
-
-class ScreenSelectorOverlay(QWidget):
-    """Overlay for custom area selection."""
-
-    def __init__(self, callback=None):
-        super().__init__()
-        self.callback = callback
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setCursor(Qt.CursorShape.CrossCursor)
-        self.showFullScreen()
-
-        self.start_point = None
-        self.end_point = None
-        self.is_drawing = False
-
-    def mouseMoveEvent(self, event):
-        if self.is_drawing:
-            self.end_point = event.pos()
-            self.update()
-
-    def mousePressEvent(self, event):
-        self.start_point = event.pos()
-        self.end_point = event.pos()
-        self.is_drawing = True
-        self.update()
-
-    def mouseReleaseEvent(self, event):
-        if self.is_drawing:
-            self.is_drawing = False
-            rect = QRect(self.start_point, self.end_point).normalized()
-            region = {
-                "top": rect.top(),
-                "left": rect.left(),
-                "width": rect.width(),
-                "height": rect.height(),
-            }
-            self.close()
-            if self.callback:
-                self.callback(region)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 100))
-
-        if self.start_point and self.end_point:
-            rect = QRect(self.start_point, self.end_point).normalized()
-            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-            painter.fillRect(rect, QColor(0, 0, 0, 0))
-            painter.setCompositionMode(
-                QPainter.CompositionMode.CompositionMode_SourceOver
-            )
-            painter.setPen(QPen(QColor(212, 175, 55), 2))
-            painter.drawRect(rect)
-
-
-class ScreenRecorderApp(QMainWindow):
+class ScreenRecorderApp(AreaCropControlMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         self.full_window_title = "SCRAP - Screen Capture & Recording Platform"
@@ -332,6 +77,8 @@ class ScreenRecorderApp(QMainWindow):
         self.audio_temp_path = None
         self.ffmpeg_error_output = ""
         self.current_output_file = None
+        self.mux_thread = None
+        self.mux_worker = None
         self.active_audio_source = "No Audio"
         self.is_compact_mode = False
         self.area_crop_port = None
@@ -746,6 +493,9 @@ class ScreenRecorderApp(QMainWindow):
             pass
         self.audio_temp_path = None
 
+    def _set_audio_capture_error(self, error):
+        self.audio_capture_error = str(error)
+
     def on_area_selected(self, region):
         with mss.MSS() as sct:
             bounds = dict(sct.monitors[1])
@@ -770,97 +520,6 @@ class ScreenRecorderApp(QMainWindow):
         )
         self.active_border.show()
         self.show()
-
-    def on_area_region_changed(self, region):
-        self.area_region = dict(region)
-        if self.area_crop_update_event is None:
-            return
-        with self.area_crop_lock:
-            self.pending_area_region = dict(region)
-        self.area_crop_update_event.set()
-
-    def _start_area_crop_control(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as port_socket:
-            port_socket.bind(("127.0.0.1", 0))
-            self.area_crop_port = port_socket.getsockname()[1]
-
-        self.area_crop_stop = threading.Event()
-        self.area_crop_update_event = threading.Event()
-        self.pending_area_region = dict(self.area_region)
-        self.area_crop_error = None
-        self.area_crop_thread = threading.Thread(
-            target=self._area_crop_command_worker,
-            args=(self.area_crop_port, self.area_crop_stop),
-            daemon=True,
-        )
-        self.area_crop_thread.start()
-        return self.area_crop_port
-
-    def _area_crop_command_worker(self, port, stop_event):
-        import zmq
-
-        context = zmq.Context()
-        client = None
-
-        def connect_client():
-            new_client = context.socket(zmq.REQ)
-            new_client.setsockopt(zmq.LINGER, 0)
-            new_client.setsockopt(zmq.SNDTIMEO, 200)
-            new_client.connect(f"tcp://127.0.0.1:{port}")
-            return new_client
-
-        client = connect_client()
-        last_region = None
-        try:
-            while not stop_event.is_set():
-                if not self.area_crop_update_event.wait(0.1):
-                    continue
-                self.area_crop_update_event.clear()
-                with self.area_crop_lock:
-                    region = dict(self.pending_area_region)
-                if region == last_region:
-                    continue
-
-                monitor_left = self.area_region_bounds["left"]
-                monitor_top = self.area_region_bounds["top"]
-                values = {
-                    "w": region["width"],
-                    "h": region["height"],
-                    "x": region["left"] - monitor_left,
-                    "y": region["top"] - monitor_top,
-                }
-                try:
-                    for option, value in values.items():
-                        client.send_string(f"crop@area {option} {value}")
-                        if not client.poll(250):
-                            raise zmq.Again()
-                        response = client.recv_string()
-                        if not response.startswith("0 "):
-                            raise RuntimeError(response)
-                    last_region = region
-                except (zmq.ZMQError, RuntimeError) as exc:
-                    self.area_crop_error = str(exc)
-                    client.close(0)
-                    client = connect_client()
-                    with self.area_crop_lock:
-                        self.pending_area_region = region
-                    self.area_crop_update_event.set()
-                    stop_event.wait(0.1)
-        finally:
-            client.close(0)
-            context.term()
-
-    def _stop_area_crop_control(self):
-        if self.area_crop_stop is not None:
-            self.area_crop_stop.set()
-        if self.area_crop_update_event is not None:
-            self.area_crop_update_event.set()
-        if self.area_crop_thread is not None:
-            self.area_crop_thread.join(timeout=2)
-        self.area_crop_port = None
-        self.area_crop_stop = None
-        self.area_crop_thread = None
-        self.area_crop_update_event = None
 
     def toggle_recording(self):
         if self.is_counting_down:
@@ -952,162 +611,13 @@ class ScreenRecorderApp(QMainWindow):
         self.compact_timer.setText(text)
 
     def resolve_target_size(self, selected_q):
-        if "Native / Original" in selected_q:
-            return None
-        if "720p" in selected_q:
-            return (1280, 720)
-        if "1080p" in selected_q:
-            return (1920, 1080)
-        if "1440p" in selected_q:
-            return (2560, 1440)
-        return None
+        return resolve_target_size_service(selected_q)
 
     def detect_video_encoder(self):
-        hardware_encoders = (
-            ("h264_qsv", ["-preset", "4", "-global_quality", "20"]),
-            ("h264_mf", ["-rate_control", "3", "-quality", "80"]),
-        )
-        for encoder, encoder_options in hardware_encoders:
-            probe_cmd = [
-                FFMPEG_EXE,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=c=black:s=320x240:r=1",
-                "-frames:v",
-                "1",
-                "-c:v",
-                encoder,
-                *encoder_options,
-                "-pix_fmt",
-                "yuv420p",
-                "-f",
-                "null",
-                "-",
-            ]
-            try:
-                result = subprocess.run(
-                    probe_cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    timeout=8,
-                    **hidden_subprocess_kwargs(),
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                continue
-            if result.returncode == 0:
-                return encoder
-        return "libx264"
-
-    @staticmethod
-    def _normalize_audio_device_name(name):
-        if not name:
-            return ""
-        normalized = re.sub(r"[^a-z0-9]+", "", str(name).lower())
-        for prefix in ("microphone", "speakers", "headphones", "output", "input"):
-            if normalized.startswith(prefix):
-                normalized = normalized[len(prefix):]
-                break
-        return normalized or re.sub(r"[^a-z0-9]+", "", str(name).lower())
-
-    def _find_soundcard_microphone(self, devices, requested_name=None):
-        if not devices:
-            return None
-        if requested_name:
-            exact = [
-                device
-                for device in devices
-                if device.name.strip().lower() == requested_name.strip().lower()
-            ]
-            if exact:
-                return exact[0]
-
-            requested_key = self._normalize_audio_device_name(requested_name)
-            normalized = [
-                device
-                for device in devices
-                if self._normalize_audio_device_name(device.name) == requested_key
-                and requested_key
-            ]
-            if normalized:
-                return normalized[0]
-
-            requested_key = requested_key.casefold()
-            partial = [
-                device
-                for device in devices
-                if requested_key
-                and (
-                    requested_key
-                    in self._normalize_audio_device_name(device.name).casefold()
-                    or self._normalize_audio_device_name(device.name).casefold()
-                    in requested_key
-                )
-            ]
-            if partial:
-                return partial[0]
-        return None
+        return detect_video_encoder_service()
 
     def discover_audio_devices(self):
-        try:
-            import soundcard
-
-            devices = []
-            seen = set()
-            for microphone in soundcard.all_microphones(include_loopback=True):
-                if microphone.isloopback:
-                    continue
-                name = str(getattr(microphone, "name", "")).strip()
-                key = self._normalize_audio_device_name(name)
-                if name and key and key not in seen:
-                    seen.add(key)
-                    devices.append(name)
-            if devices:
-                return [
-                    "No Audio",
-                    "Desktop Audio",
-                    "Desktop + Microphone",
-                    *devices,
-                ]
-        except Exception:
-            pass
-
-        try:
-            ffmpeg_cmd = [
-                FFMPEG_EXE,
-                "-hide_banner",
-                "-list_devices",
-                "true",
-                "-f",
-                "dshow",
-                "-i",
-                "dummy",
-            ]
-            result = subprocess.run(
-                ffmpeg_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=False,
-                **hidden_subprocess_kwargs(),
-            )
-            devices = []
-            seen = set()
-            for line in result.stdout.splitlines():
-                match = re.search(r'"([^"]+)" \(audio\)', line)
-                if match:
-                    name = match.group(1)
-                    if name and name not in seen:
-                        seen.add(name)
-                        devices.append(name)
-            return ["No Audio", "Desktop Audio", "Desktop + Microphone", *devices]
-        except Exception:
-            pass
-        return ["No Audio", "Desktop Audio", "Desktop + Microphone"]
+        return discover_audio_devices()
 
     def start_recording(self):
         selected_q = self.combo_quality.currentText()
@@ -1174,7 +684,7 @@ class ScreenRecorderApp(QMainWindow):
             audio_ready = threading.Event()
             self.audio_capture_error = None
             self.audio_capture_thread = threading.Thread(
-                target=self.capture_audio_source,
+                target=capture_audio_worker,
                 args=(
                     self.audio_temp_path,
                     self.audio_capture_stop,
@@ -1182,6 +692,7 @@ class ScreenRecorderApp(QMainWindow):
                     selected_audio,
                     self.audio_capture_pause,
                 ),
+                kwargs={"error_callback": self._set_audio_capture_error},
             )
             self.audio_capture_thread.start()
             if not audio_ready.wait(timeout=10) or self.audio_capture_error:
@@ -1238,186 +749,49 @@ class ScreenRecorderApp(QMainWindow):
         )
         self.rec_thread.start()
 
-    def capture_audio_source(
-        self, output_file, stop_event, ready_event, audio_source, pause_event
-    ):
-        try:
-            import soundcard
+    def _start_audio_mux(self):
+        muxed_file = self.current_output_file.with_name(
+            f"{self.current_output_file.stem}.muxed.mp4"
+        )
+        self.mux_thread = QThread(self)
+        self.mux_worker = MuxWorker(
+            self.current_output_file,
+            self.audio_temp_path,
+            muxed_file,
+        )
+        self.mux_worker.moveToThread(self.mux_thread)
+        self.mux_thread.started.connect(self.mux_worker.run)
+        self.mux_worker.finished.connect(self._handle_mux_finished)
+        self.mux_worker.finished.connect(self.mux_thread.quit)
+        self.mux_thread.finished.connect(self.mux_worker.deleteLater)
+        self.mux_thread.finished.connect(self.mux_thread.deleteLater)
+        self.mux_thread.start()
 
-            combined_audio = audio_source == "Desktop + Microphone"
-            is_desktop_audio = audio_source == "Desktop Audio"
-            input_devices = [
-                microphone
-                for microphone in soundcard.all_microphones(include_loopback=True)
-                if microphone.isloopback == is_desktop_audio
-            ]
-            if not combined_audio and not input_devices:
-                raise RuntimeError("No matching audio input device is available.")
+    def _handle_mux_finished(self, success, details):
+        if not success:
+            self.lbl_status.setText("Audio mux failed")
+            self._cleanup_desktop_audio_temp()
+            self._restore_idle_controls()
+            QMessageBox.warning(self, "Audio Mux Failed", details)
+            return
+        self._cleanup_desktop_audio_temp()
+        self._finish_successful_save()
 
-            if combined_audio or is_desktop_audio:
-                default_speaker = soundcard.default_speaker()
-                expected_names = {
-                    name.strip().lower()
-                    for name in (
-                        default_speaker.name,
-                        getattr(default_speaker, "name", ""),
-                    )
-                    if name
-                }
-                microphone = next(
-                    (
-                        device
-                        for device in input_devices
-                        if device.name.strip().lower() in expected_names
-                    ),
-                    input_devices[0],
-                )
-            else:
-                microphone = self._find_soundcard_microphone(
-                    input_devices,
-                    audio_source,
-                )
-                if microphone is None:
-                    raise RuntimeError(
-                        f"The selected audio input was not found: {audio_source}"
-                    )
-
-            if combined_audio:
-                loopback_devices = [
-                    device
-                    for device in soundcard.all_microphones(include_loopback=True)
-                    if device.isloopback
-                ]
-                if not loopback_devices:
-                    raise RuntimeError("No desktop audio loopback device is available.")
-
-                microphones = [
-                    device
-                    for device in soundcard.all_microphones(include_loopback=True)
-                    if not device.isloopback
-                ]
-                if not microphones:
-                    raise RuntimeError("No microphone input device is available.")
-
-                try:
-                    microphone = soundcard.default_microphone()
-                except Exception:
-                    microphone = None
-                if microphone is None:
-                    microphone = microphones[0]
-                else:
-                    microphone = (
-                        self._find_soundcard_microphone(
-                            microphones,
-                            microphone.name,
-                        )
-                        or microphones[0]
-                    )
-
-                default_speaker = soundcard.default_speaker()
-                expected_names = {
-                    name.strip().lower()
-                    for name in (
-                        default_speaker.name,
-                        getattr(default_speaker, "name", ""),
-                    )
-                    if name
-                }
-                desktop = next(
-                    (
-                        device
-                        for device in loopback_devices
-                        if device.name.strip().lower() in expected_names
-                    ),
-                    loopback_devices[0],
-                )
-                desktop_channels = max(1, min(desktop.channels, 2))
-                microphone_channels = max(1, min(microphone.channels, 2))
-
-                with wave.open(str(output_file), "wb") as audio_file:
-                    audio_file.setnchannels(2)
-                    audio_file.setsampwidth(2)
-                    audio_file.setframerate(48000)
-
-                    with desktop.recorder(
-                        samplerate=48000,
-                        channels=list(range(desktop_channels)),
-                        blocksize=24000,
-                    ) as desktop_recorder, microphone.recorder(
-                        samplerate=48000,
-                        channels=list(range(microphone_channels)),
-                        blocksize=24000,
-                    ) as microphone_recorder:
-                        paused_since_resumed = False
-                        while not stop_event.is_set():
-                            if pause_event.wait(timeout=0.05):
-                                paused_since_resumed = True
-                                continue
-                            if paused_since_resumed:
-                                desktop_recorder.record(numframes=4800)
-                                microphone_recorder.record(numframes=4800)
-                                paused_since_resumed = False
-
-                            desktop_samples = desktop_recorder.record(numframes=4800)
-                            microphone_samples = microphone_recorder.record(
-                                numframes=4800
-                            )
-                            desktop_mono = np.mean(
-                                np.asarray(desktop_samples, dtype=np.float32),
-                                axis=-1
-                                if np.asarray(desktop_samples).ndim > 1
-                                else 0,
-                            )
-                            microphone_mono = np.mean(
-                                np.asarray(microphone_samples, dtype=np.float32),
-                                axis=-1
-                                if np.asarray(microphone_samples).ndim > 1
-                                else 0,
-                            )
-                            frame_count = min(
-                                desktop_mono.shape[0], microphone_mono.shape[0]
-                            )
-                            mixed = (
-                                desktop_mono[:frame_count] * 0.65
-                                + microphone_mono[:frame_count] * 0.85
-                            )
-                            mixed = np.clip(mixed, -1.0, 1.0)
-                            pcm_mono = (
-                                mixed * 32767
-                            ).astype(np.int16)
-                            pcm = np.column_stack((pcm_mono, pcm_mono))
-                            audio_file.writeframesraw(pcm.tobytes())
-                            ready_event.set()
-                return
-
-            channels = min(microphone.channels, 2)
-
-            with wave.open(str(output_file), "wb") as audio_file:
-                audio_file.setnchannels(channels)
-                audio_file.setsampwidth(2)
-                audio_file.setframerate(48000)
-
-                with microphone.recorder(
-                    samplerate=48000,
-                    channels=list(range(channels)),
-                    blocksize=24000,
-                ) as recorder:
-                    paused_since_resumed = False
-                    while not stop_event.is_set():
-                        if pause_event.wait(timeout=0.05):
-                            paused_since_resumed = True
-                            continue
-                        if paused_since_resumed:
-                            recorder.record(numframes=4800)
-                            paused_since_resumed = False
-                        samples = recorder.record(numframes=4800)
-                        pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
-                        audio_file.writeframesraw(pcm.tobytes())
-                        ready_event.set()
-        except Exception as exc:
-            self.audio_capture_error = str(exc)
-        finally:
-            ready_event.set()
+    def _finish_successful_save(self):
+        if (
+            not self.current_output_file.exists()
+            or self.current_output_file.stat().st_size == 0
+        ):
+            self.lbl_status.setText("Recording failed")
+            self._cleanup_desktop_audio_temp()
+            self._restore_idle_controls()
+            QMessageBox.warning(
+                self, "Recording Failed", "FFmpeg did not create a playable recording."
+            )
+            return
+        self.lbl_status.setText("Saved")
+        self._restore_idle_controls()
+        QMessageBox.information(self, "Saved", f"Recording saved to:\n{VIDEO_DIR}")
 
     def stop_recording(self):
         if self.active_border is not None:
@@ -1507,140 +881,21 @@ class ScreenRecorderApp(QMainWindow):
                 )
                 return
 
-            muxed_file = self.current_output_file.with_name(
-                f"{self.current_output_file.stem}.muxed.mp4"
-            )
-            mux_result = subprocess.run(
-                [
-                    FFMPEG_EXE,
-                    "-y",
-                    "-i",
-                    str(self.current_output_file),
-                    "-i",
-                    str(self.audio_temp_path),
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "1:a:0",
-                    "-c:v",
-                    "copy",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "192k",
-                    "-af",
-                    "aresample=async=1:first_pts=0",
-                    "-shortest",
-                    "-movflags",
-                    "+faststart",
-                    str(muxed_file),
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-                **hidden_subprocess_kwargs(),
-            )
-            if mux_result.returncode != 0 or not muxed_file.exists():
-                self.lbl_status.setText("Audio mux failed")
-                details = (
-                    mux_result.stderr[-1200:] or "FFmpeg could not mux desktop audio."
-                )
-                muxed_file.unlink(missing_ok=True)
-                self._cleanup_desktop_audio_temp()
-                self._restore_idle_controls()
-                QMessageBox.warning(self, "Audio Mux Failed", details)
-                return
-
-            os.replace(muxed_file, self.current_output_file)
-            self._cleanup_desktop_audio_temp()
-
-        if (
-            not self.current_output_file.exists()
-            or self.current_output_file.stat().st_size == 0
-        ):
-            self.lbl_status.setText("Recording failed")
-            self._cleanup_desktop_audio_temp()
-            self._restore_idle_controls()
-            QMessageBox.warning(
-                self, "Recording Failed", "FFmpeg did not create a playable recording."
-            )
+            self._start_audio_mux()
             return
 
-        self.lbl_status.setText("Saved")
-        self._restore_idle_controls()
-        QMessageBox.information(self, "Saved", f"Recording saved to:\n{VIDEO_DIR}")
+        self._finish_successful_save()
 
     def record_engine(self, output_file, fps, target_size=None, crop_control_port=None):
-        with mss.MSS() as sct:
-            monitor = dict(sct.monitors[1])
-
-        width = monitor["width"]
-        height = monitor["height"]
-        left = monitor["left"]
-        top = monitor["top"]
-
-        width = width if width % 2 == 0 else width - 1
-        height = height if height % 2 == 0 else height - 1
-
-        ffmpeg_cmd = [
-            FFMPEG_EXE,
-            "-y",
-            "-f",
-            "gdigrab",
-            "-framerate",
-            str(fps),
-            "-offset_x",
-            str(left),
-            "-offset_y",
-            str(top),
-            "-video_size",
-            f"{width}x{height}",
-            "-i",
-            "desktop",
-        ]
-
-        if self.selected_mode == "Area" and self.area_region:
-            region = dict(self.area_region)
-            crop_width = region["width"] - region["width"] % 2
-            crop_height = region["height"] - region["height"] % 2
-            output_width, output_height = target_size or (crop_width, crop_height)
-            crop_x = region["left"] - left
-            crop_y = region["top"] - top
-            escaped = "\\" * 2
-            zmq_address = f"tcp{escaped}://127.0.0.1{escaped}:{crop_control_port}"
-            video_filter = (
-                f"zmq=bind_address={zmq_address},"
-                f"crop@area={crop_width}:{crop_height}:{crop_x}:{crop_y},"
-                f"scale={output_width}:{output_height}:"
-                "force_original_aspect_ratio=decrease,"
-                f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
-            )
-            ffmpeg_cmd += [
-                "-vf",
-                video_filter,
-            ]
-        elif target_size is not None:
-            output_width, output_height = target_size
-            ffmpeg_cmd += [
-                "-vf",
-                f"scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,"
-                f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,setsar=1",
-            ]
-
-        ffmpeg_cmd += ["-c:v", self.video_encoder]
-        if self.video_encoder == "h264_qsv":
-            ffmpeg_cmd += ["-preset", "4", "-global_quality", "18"]
-        elif self.video_encoder == "h264_mf":
-            ffmpeg_cmd += ["-rate_control", "3", "-quality", "88"]
-        else:
-            ffmpeg_cmd += ["-preset", "veryfast", "-crf", "18"]
-        ffmpeg_cmd += ["-pix_fmt", "yuv420p"]
-
-        ffmpeg_cmd += ["-an", "-movflags", "+faststart"]
-
-        ffmpeg_cmd.append(str(output_file))
-
+        ffmpeg_cmd = build_capture_command(
+            output_file,
+            fps,
+            self.video_encoder,
+            self.selected_mode,
+            self.area_region,
+            target_size,
+            crop_control_port,
+        )
         stderr_log = tempfile.TemporaryFile()
         self.ffmpeg_process = subprocess.Popen(
             ffmpeg_cmd,
@@ -1651,10 +906,8 @@ class ScreenRecorderApp(QMainWindow):
         )
         if self.is_paused:
             self._suspend_ffmpeg_process()
-
         while self.is_recording:
             time.sleep(0.05)
-
         process = self.ffmpeg_process
         if process and process.poll() is None:
             try:
@@ -1669,105 +922,20 @@ class ScreenRecorderApp(QMainWindow):
                 except Exception:
                     process.kill()
                     process.wait(timeout=10)
-
-                if process and process.stdin and not process.stdin.closed:
+                if process.stdin and not process.stdin.closed:
                     process.stdin.close()
-
         if process:
             self.ffmpeg_returncode = ctypes.c_int32(process.returncode).value
         stderr_log.seek(0)
-        self.ffmpeg_error_output = stderr_log.read().decode("utf-8", errors="replace")[
-            -4000:
-        ]
+        self.ffmpeg_error_output = stderr_log.read().decode(
+            "utf-8", errors="replace"
+        )[-4000:]
         stderr_log.close()
         self.ffmpeg_process = None
 
     def open_gallery(self):
         self.gallery = GalleryWindow()
         self.gallery.show()
-
-
-class GalleryWindow(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("SCRAP - Saved Recordings")
-        self.setGeometry(200, 200, 440, 320)
-
-        icon_path = resource_path("assets/icon.png")
-        if icon_path.exists():
-            self.setWindowIcon(QIcon(str(icon_path)))
-
-        self.setStyleSheet("""
-            QWidget { background-color: #1c1a19; color: #ffffff; }
-            QListWidget {
-                background-color: #2b2725;
-                border: 1px solid #423c39;
-                border-radius: 6px;
-                padding: 6px;
-                color: #ffffff;
-            }
-            QListWidget::item:selected {
-                background-color: #3e2e21;
-                color: #d4af37;
-            }
-            QPushButton {
-                background-color: #2b2725;
-                border: 1px solid #423c39;
-                border-radius: 6px;
-                padding: 8px 12px;
-                font-weight: 600;
-                color: #d2c7c1;
-            }
-            QPushButton:hover {
-                background-color: #383330;
-                border-color: #635752;
-            }
-        """)
-
-        layout = QVBoxLayout(self)
-        self.list_widget = QListWidget()
-        layout.addWidget(self.list_widget)
-
-        btn_layout = QHBoxLayout()
-        self.btn_open = QPushButton("Play Video")
-        self.btn_delete = QPushButton("Delete Video")
-
-        self.btn_open.clicked.connect(self.play_selected)
-        self.btn_delete.clicked.connect(self.delete_selected)
-
-        btn_layout.addWidget(self.btn_open)
-        btn_layout.addWidget(self.btn_delete)
-        layout.addLayout(btn_layout)
-
-        self.refresh_list()
-
-    def refresh_list(self):
-        self.list_widget.clear()
-        VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-
-        # Grab both mp4 and avi files, excluding temporary files
-        recordings = [
-            f.name
-            for f in VIDEO_DIR.glob("*.*")
-            if f.suffix.lower() in (".mp4", ".avi") and not f.name.startswith("temp_")
-        ]
-
-        for filename in sorted(recordings, reverse=True):
-            self.list_widget.addItem(filename)
-
-    def play_selected(self):
-        item = self.list_widget.currentItem()
-        if item:
-            file_path = VIDEO_DIR / item.text()
-            os.startfile(file_path)
-
-    def delete_selected(self):
-        item = self.list_widget.currentItem()
-        if item:
-            file_path = VIDEO_DIR / item.text()
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                self.refresh_list()
 
 
 if __name__ == "__main__":
