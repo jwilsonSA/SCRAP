@@ -1077,11 +1077,19 @@ class ScreenRecorderApp(QMainWindow):
 
             if is_desktop_audio:
                 default_speaker = soundcard.default_speaker()
+                expected_names = {
+                    name.strip().lower()
+                    for name in (
+                        default_speaker.name,
+                        getattr(default_speaker, "name", ""),
+                    )
+                    if name
+                }
                 microphone = next(
                     (
                         device
                         for device in input_devices
-                        if device.name == default_speaker.name
+                        if device.name.strip().lower() in expected_names
                     ),
                     input_devices[0],
                 )
@@ -1213,6 +1221,9 @@ class ScreenRecorderApp(QMainWindow):
                     "aac",
                     "-b:a",
                     "192k",
+                    "-af",
+                    "aresample=async=1:first_pts=0",
+                    "-shortest",
                     "-movflags",
                     "+faststart",
                     str(muxed_file),
@@ -1302,23 +1313,6 @@ class ScreenRecorderApp(QMainWindow):
                 "-vf",
                 video_filter,
             ]
-        if self.selected_mode == "Area" and self.area_region:
-            region = dict(self.area_region)
-            crop_width = region["width"] - region["width"] % 2
-            crop_height = region["height"] - region["height"] % 2
-            output_width, output_height = target_size or (crop_width, crop_height)
-            crop_x = region["left"] - left
-            crop_y = region["top"] - top
-            escaped = "\\" * 2
-            zmq_address = f"tcp{escaped}://127.0.0.1{escaped}:{crop_control_port}"
-            video_filter = (
-                f"zmq=bind_address={zmq_address},"
-                f"crop@area={crop_width}:{crop_height}:{crop_x}:{crop_y},"
-                f"scale={output_width}:{output_height}:"
-                "force_original_aspect_ratio=decrease,"
-                f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
-            )
-            ffmpeg_cmd += ["-vf", video_filter]
         elif target_size is not None:
             output_width, output_height = target_size
             ffmpeg_cmd += [
@@ -1329,11 +1323,11 @@ class ScreenRecorderApp(QMainWindow):
 
         ffmpeg_cmd += ["-c:v", self.video_encoder]
         if self.video_encoder == "h264_qsv":
-            ffmpeg_cmd += ["-preset", "4", "-global_quality", "20"]
+            ffmpeg_cmd += ["-preset", "4", "-global_quality", "18"]
         elif self.video_encoder == "h264_mf":
-            ffmpeg_cmd += ["-rate_control", "3", "-quality", "80"]
+            ffmpeg_cmd += ["-rate_control", "3", "-quality", "88"]
         else:
-            ffmpeg_cmd += ["-preset", "veryfast", "-crf", "20"]
+            ffmpeg_cmd += ["-preset", "veryfast", "-crf", "18"]
         ffmpeg_cmd += ["-pix_fmt", "yuv420p"]
 
         ffmpeg_cmd += ["-an", "-movflags", "+faststart"]
