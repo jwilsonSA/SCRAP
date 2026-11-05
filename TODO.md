@@ -40,7 +40,7 @@ Items are ordered from easiest to hardest. Complete each section before moving t
 ## Medium
 
 ### Audio
-- [ ] Mix desktop audio and microphone audio into one track.
+- [x] Mix desktop audio and microphone audio into one track.
 - [ ] Add independent mute controls for desktop and microphone sources.
 - [ ] Add optional noise reduction.
 - [ ] Add optional audio normalization.

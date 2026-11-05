@@ -1032,10 +1032,10 @@ class ScreenRecorderApp(QMainWindow):
                     if name and name not in seen:
                         seen.add(name)
                         devices.append(name)
-            return ["No Audio", "Desktop Audio", *devices]
+            return ["No Audio", "Desktop Audio", "Desktop + Microphone", *devices]
         except Exception:
             pass
-        return ["No Audio", "Desktop Audio"]
+        return ["No Audio", "Desktop Audio", "Desktop + Microphone"]
 
     def start_recording(self):
         selected_q = self.combo_quality.currentText()
@@ -1172,16 +1172,17 @@ class ScreenRecorderApp(QMainWindow):
         try:
             import soundcard
 
+            combined_audio = audio_source == "Desktop + Microphone"
             is_desktop_audio = audio_source == "Desktop Audio"
             input_devices = [
                 microphone
                 for microphone in soundcard.all_microphones(include_loopback=True)
                 if microphone.isloopback == is_desktop_audio
             ]
-            if not input_devices:
+            if not combined_audio and not input_devices:
                 raise RuntimeError("No matching audio input device is available.")
 
-            if is_desktop_audio:
+            if combined_audio or is_desktop_audio:
                 default_speaker = soundcard.default_speaker()
                 expected_names = {
                     name.strip().lower()
@@ -1208,6 +1209,116 @@ class ScreenRecorderApp(QMainWindow):
                     raise RuntimeError(
                         f"The selected audio input was not found: {audio_source}"
                     )
+
+            if combined_audio:
+                loopback_devices = [
+                    device
+                    for device in soundcard.all_microphones(include_loopback=True)
+                    if device.isloopback
+                ]
+                if not loopback_devices:
+                    raise RuntimeError("No desktop audio loopback device is available.")
+
+                microphones = [
+                    device
+                    for device in soundcard.all_microphones(include_loopback=True)
+                    if not device.isloopback
+                ]
+                if not microphones:
+                    raise RuntimeError("No microphone input device is available.")
+
+                try:
+                    microphone = soundcard.default_microphone()
+                except Exception:
+                    microphone = None
+                if microphone is None:
+                    microphone = microphones[0]
+                else:
+                    microphone = next(
+                        (
+                            device
+                            for device in microphones
+                            if device.name == microphone.name
+                        ),
+                        microphones[0],
+                    )
+
+                default_speaker = soundcard.default_speaker()
+                expected_names = {
+                    name.strip().lower()
+                    for name in (
+                        default_speaker.name,
+                        getattr(default_speaker, "name", ""),
+                    )
+                    if name
+                }
+                desktop = next(
+                    (
+                        device
+                        for device in loopback_devices
+                        if device.name.strip().lower() in expected_names
+                    ),
+                    loopback_devices[0],
+                )
+                desktop_channels = max(1, min(desktop.channels, 2))
+                microphone_channels = max(1, min(microphone.channels, 2))
+
+                with wave.open(str(output_file), "wb") as audio_file:
+                    audio_file.setnchannels(2)
+                    audio_file.setsampwidth(2)
+                    audio_file.setframerate(48000)
+
+                    with desktop.recorder(
+                        samplerate=48000,
+                        channels=list(range(desktop_channels)),
+                        blocksize=24000,
+                    ) as desktop_recorder, microphone.recorder(
+                        samplerate=48000,
+                        channels=list(range(microphone_channels)),
+                        blocksize=24000,
+                    ) as microphone_recorder:
+                        paused_since_resumed = False
+                        while not stop_event.is_set():
+                            if pause_event.wait(timeout=0.05):
+                                paused_since_resumed = True
+                                continue
+                            if paused_since_resumed:
+                                desktop_recorder.record(numframes=4800)
+                                microphone_recorder.record(numframes=4800)
+                                paused_since_resumed = False
+
+                            desktop_samples = desktop_recorder.record(numframes=4800)
+                            microphone_samples = microphone_recorder.record(
+                                numframes=4800
+                            )
+                            desktop_mono = np.mean(
+                                np.asarray(desktop_samples, dtype=np.float32),
+                                axis=-1
+                                if np.asarray(desktop_samples).ndim > 1
+                                else 0,
+                            )
+                            microphone_mono = np.mean(
+                                np.asarray(microphone_samples, dtype=np.float32),
+                                axis=-1
+                                if np.asarray(microphone_samples).ndim > 1
+                                else 0,
+                            )
+                            frame_count = min(
+                                desktop_mono.shape[0], microphone_mono.shape[0]
+                            )
+                            mixed = (
+                                desktop_mono[:frame_count]
+                                + microphone_mono[:frame_count]
+                            ) * 0.5
+                            mixed = np.clip(mixed, -1.0, 1.0)
+                            pcm_mono = (
+                                mixed * 32767
+                            ).astype(np.int16)
+                            pcm = np.column_stack((pcm_mono, pcm_mono))
+                            audio_file.writeframesraw(pcm.tobytes())
+                            ready_event.set()
+                return
+
             channels = min(microphone.channels, 2)
 
             with wave.open(str(output_file), "wb") as audio_file:
