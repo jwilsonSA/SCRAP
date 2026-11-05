@@ -71,7 +71,9 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # UPX-compressed Python executables are frequently flagged as suspicious by
+    # Windows security products even when they contain no malware.
+    upx=False,
     upx_exclude=[],
     console=False,
     disable_windowed_traceback=False,

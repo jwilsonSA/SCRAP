@@ -47,20 +47,63 @@ if (-not (Test-Path $ExePath)) {
     throw "Build failed: SCRAP.exe was not created."
 }
 
+$CertificatePath = $env:SCRAP_CERTIFICATE_PFX
+$CertificatePassword = $env:SCRAP_CERTIFICATE_PASSWORD
+$TimestampUrl = if ($env:SCRAP_TIMESTAMP_URL) { $env:SCRAP_TIMESTAMP_URL } else { "http://timestamp.digicert.com" }
+
+if ($CertificatePath) {
+    if (-not (Test-Path $CertificatePath)) {
+        throw "SCRAP_CERTIFICATE_PFX does not point to an existing certificate."
+    }
+
+    $SignTool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter signtool.exe -Recurse -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1
+    if (-not $SignTool) {
+        throw "Signing was requested, but signtool.exe was not found."
+    }
+
+    $SignArguments = @(
+        "sign", "/fd", "SHA256", "/tr", $TimestampUrl, "/td", "SHA256",
+        "/f", $CertificatePath
+    )
+    if ($CertificatePassword) {
+        $SignArguments += @("/p", $CertificatePassword)
+    }
+    $SignArguments += $ExePath
+
+    & $SignTool.FullName $SignArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Authenticode signing failed."
+    }
+} else {
+    Write-Host "Signing skipped: set SCRAP_CERTIFICATE_PFX to sign SCRAP.exe."
+}
+
 $ReadmePath = Join-Path $ProjectRoot "dist\README.txt"
 @"
 SCRAP Screen Capture and Recording Platform
 
-1. Extract SCRAP.exe and README.txt from this zip.
-2. Run SCRAP.exe. No Python installation or setup is required.
+1. Download SCRAP-Portable.zip only from the official SCRAP GitHub Releases page.
+2. Extract all files, keeping SCRAP.exe and README.txt together.
+3. Run the extracted SCRAP.exe. Do not run SCRAP.exe from inside a source-code ZIP.
+No Python installation or setup is required.
 
-SCRAP.exe is a self-contained portable application. It may create a temporary
-runtime folder while starting, then remove it when closed.
+SCRAP is a screen-recording utility. It records only the screen/audio sources
+you select and saves files locally. It does not contain or require a browser
+extension or telemetry service.
 
 Recordings are saved automatically under the current user's Videos folder:
 Videos\ScreenRecordings
 
-Windows may show SmartScreen or antivirus warnings for an unsigned app.
+Verification and Windows warnings
+- Verify the SCRAP.exe SHA-256 hash listed in SHA256SUMS.txt.
+- Windows SmartScreen or antivirus may warn about an unsigned or newly released
+  application. If the hash does not match this release's hashes, delete the file.
+- Do not grant overrides to a copy downloaded from an unofficial source.
+- False positives should be reported to your antivirus vendor with the official
+  release URL and SHA-256 hash. If you are the maintainer, submit the signed
+  binary to Microsoft and/or VirusTotal for reputation review.
 "@ | Set-Content -Path $ReadmePath -Encoding ASCII
 
 $PackageFolder = Join-Path $ProjectRoot "dist\SCRAP-Portable"
@@ -70,6 +113,11 @@ if (Test-Path $PackageFolder) {
 New-Item -ItemType Directory -Path $PackageFolder | Out-Null
 Copy-Item $ExePath -Destination $PackageFolder
 Copy-Item $ReadmePath -Destination $PackageFolder
+
+$HashFile = Join-Path $PackageFolder "SHA256SUMS.txt"
+Get-FileHash $ExePath -Algorithm SHA256 |
+    ForEach-Object { "$($_.Hash.ToLower())  SCRAP.exe" } |
+    Set-Content -Path $HashFile -Encoding ASCII
 
 $ZipPath = Join-Path $ProjectRoot "dist\SCRAP-Portable.zip"
 if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
